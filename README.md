@@ -68,6 +68,21 @@ out        = model(x, edge_index)
 print(out.shape)  # torch.Size([100, 8])
 ```
 
+## RUN tests
+Make sure your project can detect your GPU by,
+
+```python
+import torch
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0))
+```
+
+Run all 44 tests:
+```bash
+python run_tests.py
+```
+
+If This fails to run, It mostly is a path error inside run_tests.py. Change according to your file system.
 
 ## Project layout
 
