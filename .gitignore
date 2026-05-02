@@ -1,5 +1,10 @@
+#Python files to ignore
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyo
 *.pyd
+
+#Distribution / packaging files to ignore
+build/
+*.egg-info/
