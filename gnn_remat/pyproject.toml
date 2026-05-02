@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gnn-remat"
+version = "0.1.0"
+description = "Aggregation-granular rematerialization for PyTorch Geometric"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0", "torch_geometric>=2.3"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+gnn-remat-bench = "gnn_remat.benchmark.runner:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
