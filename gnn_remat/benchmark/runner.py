@@ -53,7 +53,7 @@ def main(argv=None):
         description="GNN-Remat benchmark runner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--model",    default="gcn",  help="gcn | graphsage | gat")
+    parser.add_argument("--model",    default="gat",  help="gcn | graphsage | gat")
     parser.add_argument("--all",      action="store_true", help="Run all three models")
     parser.add_argument("--nodes",    type=int, default=5000,  help="Number of nodes")
     parser.add_argument("--features", type=int, default=128,   help="Node feature dimension")
