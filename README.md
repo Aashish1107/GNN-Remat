@@ -84,6 +84,15 @@ python run_tests.py
 
 If This fails to run, It mostly is a path error inside run_tests.py. Change according to your file system.
 
+## Benchmarks
+
+!!!Careful using benchmark.runner
+If the benchmark execution fails before printing anything in the terminal that means the Baseline crashed which is inline with program.
+
+This will be updated to handle the Crash with a --remat-only or a --avoid-Baseline extension or will be inbuilt into the runner.py program by default.
+
+For now be careful with the size of the model, i.e number of nodes and features
+
 ## Project layout
 
 ```
@@ -92,8 +101,7 @@ gnn_remat/
 │   ├── detector.py     # finds MessagePassing modules in any model
 │   ├── wrapper.py      # _RematConv: checkpoints a single conv layer
 │   ├── transform.py    # applies wrappers to a model (the compiler pass)
-│   ├── heuristic.py    # auto-selects which layers to checkpoint
-|   └── replacer.py     #
+│   └── heuristic.py    # auto-selects which layers to checkpoint
 ├── benchmark/
 │   ├── profiler.py     # measures peak GPU memory + throughput
 │   ├── models.py       # GCN, GraphSAGE, GAT reference models
