@@ -44,7 +44,7 @@ for _n in [
 sys.modules["triton"] = _t
 
 sys.path.insert(0, "/usr/local/lib/python3.12/dist-packages")
-sys.path.insert(0, "/gnn_remat")
+sys.path.insert(0, os.getcwd() + "/gnn_remat")
 
 import pytest
 args = sys.argv[1:] or [os.getcwd() + "/gnn_remat/tests/", "-v", "--tb=short", "--no-header"]
