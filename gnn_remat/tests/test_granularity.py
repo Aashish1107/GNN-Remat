@@ -79,10 +79,20 @@ def test_baseline_calls_each_once():
     assert a_calls == 1, f"Expected 1 aggregate call, got {a_calls}"
 
 
-def test_aggr_granularity_only_reruns_aggregate():
+def test_aggr_granularity_reruns_propagate():
     """
-    granularity='aggr': aggregate() is called twice (forward + recompute),
-    message() is called only once (not recomputed).
+    granularity='aggr': propagate() is checkpointed, so both message() and
+    aggregate() are called twice (forward + recompute during backward).
+
+    The distinction from 'module' granularity is *what* is recomputed:
+      aggr   — recomputes only propagate() (message + scatter)
+      module — recomputes the full layer forward(), including any linear
+               projections that the model applies before propagate()
+
+    InstrumentedGCN has its linear inside message() so both modes show
+    the same message/aggregate call counts here. The cost difference is
+    only visible when a model has expensive ops outside propagate()
+    (e.g. GATConv's lin_src / lin_dst).
     """
     conv = InstrumentedGCN(8, 16)
 
@@ -102,12 +112,11 @@ def test_aggr_granularity_only_reruns_aggregate():
     x, ei = _graph()
     model(x.clone().requires_grad_(True), ei).sum().backward()
 
-    # message() runs once (forward only — not recomputed)
-    assert inner.message_calls == 1, \
-        f"aggr mode: message() should run 1x, ran {inner.message_calls}x"
-    # aggregate() runs twice (forward + recompute during backward)
+    # Both run twice: once in the forward pass, once during recompute
+    assert inner.message_calls == 2, \
+        f"aggr mode: message() should run 2x (forward+recompute), ran {inner.message_calls}x"
     assert inner.aggregate_calls == 2, \
-        f"aggr mode: aggregate() should run 2x, ran {inner.aggregate_calls}x"
+        f"aggr mode: aggregate() should run 2x (forward+recompute), ran {inner.aggregate_calls}x"
 
 
 def test_module_granularity_reruns_everything():

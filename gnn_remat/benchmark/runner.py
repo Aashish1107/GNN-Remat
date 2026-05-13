@@ -35,14 +35,15 @@ def run_one(model_name: str, args, device):
           f"features={args.features}  layers={args.layers}")
     print(f"{'='*64}")
 
-    model = build(
-        model_name,
+    build_kwargs = dict(
         in_channels=args.features,
         hidden=args.hidden,
         out_channels=args.classes,
         num_layers=args.layers,
-        heads=args.heads,
     )
+    if model_name == "gat":
+        build_kwargs["heads"] = args.heads
+    model = build(model_name, **build_kwargs)
     # Build the graph on CPU first so an OOM here doesn't kill the whole
     # --all run — compare() will move tensors to device itself.
     graph_device = device if device.type == "cpu" else torch.device("cpu")
