@@ -3,34 +3,29 @@ gnn_remat
 ---------
 Aggregation-granular rematerialization for PyTorch Geometric.
 
-Public API
-----------
-    gnn_remat(model, ...)    apply rematerialization to a model
-    remove_remat(model)      strip all remat wrappers (for export/inference)
-    detect(model)            inspect which layers would be wrapped
-    LayerInfo                metadata dataclass returned by detect()
-
-Modes
------
-    "all"   (default) — wrap every MessagePassing layer
-    "auto"  — use the heuristic to pick only cost-effective layers
-    "names" — wrap layers by explicit dotted name list
-    "types" — wrap layers by MessagePassing subclass
-
-Quick start
------------
+Two usage styles
+----------------
+Functional (original API):
     from gnn_remat import gnn_remat
+    model = gnn_remat(model)
+    model = gnn_remat(model, mode="aggr")    # checkpoint scatter only
+    model = gnn_remat(model, mode="module")  # checkpoint full layer
 
-    model = MyGCN()
-    model = gnn_remat(model)                          # all layers, default mode
-    model = gnn_remat(model, layers=["conv1"])         # by name
-    model = gnn_remat(model, mode="auto", x=x,         # heuristic
-                      edge_index=edge_index)
+DSL / declarative (new, stronger claim):
+    import gnn_remat.core.dsl as remat
+
+    @remat.checkpoint
+    class MyGAT(nn.Module): ...
+
+    @remat.checkpoint(granularity="aggr", layers=["conv1"])
+    class MyGCN(nn.Module): ...
+
+    model = remat.checkpoint.apply(model, granularity="aggr")
 """
 
 from __future__ import annotations
 
-import logging
+import copy, logging
 from typing import List, Optional, Sequence, Type
 
 import torch
@@ -40,10 +35,13 @@ from torch_geometric.nn import MessagePassing
 from .core.detector import LayerInfo, detect as _detect
 from .core.detector import filter_by_name, filter_by_type
 from .core.heuristic import select as _heuristic_select
+from .core.dsl import _apply_to_model, AGGR, MODULE
+from .core.wrapper import _RematConv
+from .core.remat_mp import RematMessagePassing
 from .core.transform import apply as _apply
 from .core.transform import remove as _remove
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__     = ["gnn_remat", "remove_remat", "detect", "LayerInfo"]
 
 logger = logging.getLogger(__name__)
@@ -52,6 +50,7 @@ def gnn_remat(
     model: nn.Module,
     *,
     mode: str = "all",
+    granularity: str = "aggr",
     layers: Optional[Sequence[str]] = None,
     layer_types: Optional[Sequence[Type[MessagePassing]]] = None,
     x: Optional[torch.Tensor] = None,
@@ -68,7 +67,6 @@ def gnn_remat(
     Parameters
     ----------
     model : nn.Module
-        Any PyG model containing MessagePassing layers.
 
     mode : {"all", "auto", "names", "types"}
         How to select which layers to checkpoint:
@@ -80,6 +78,19 @@ def gnn_remat(
                          justifies recompute cost.  Requires *x* and
                          *edge_index*.
 
+    granularity : {"aggr", "module"}
+        What to checkpoint:
+
+        "aggr"    (default, recommended)
+            Checkpoints only the scatter-aggregation step inside propagate().
+            Linear projections and attention coefficients stay in the autograd
+            graph — they are NOT recomputed. This is the novel contribution:
+            finer granularity than torch.utils.checkpoint.
+
+        "module"
+            Checkpoints the entire MessagePassing layer (linear + attention +
+            scatter). Same as torch.utils.checkpoint. Provided for comparison.
+                                              
     layers : list[str], optional
         Dotted layer names for mode="names", e.g. ["conv1", "enc.conv2"].
 
@@ -113,7 +124,8 @@ def gnn_remat(
 
     Examples
     --------
-    >>> model = gnn_remat(model)                          # wrap all
+    >>> model = gnn_remat(model)          
+    >>> model = gnn_remat(model, granularity="module")  # module-level baseline
     >>> model = gnn_remat(model, layers=["conv1"])         # by name
     >>> model = gnn_remat(model, layer_types=[GATConv])    # by type
     >>> model = gnn_remat(model, mode="auto",              # heuristic
@@ -133,17 +145,18 @@ def gnn_remat(
 
     #Select target layers based on mode
     if mode == "all":
-        targets = all_infos
+        targets = None  # _apply_to_model treats None as "all"
 
     elif mode == "names":
         if not layers:
             raise ValueError("mode='names' requires layers=[...] to be set.")
-        targets = filter_by_name(all_infos, layers)
+        targets = list(layers)
 
     elif mode == "types":
         if not layer_types:
             raise ValueError("mode='types' requires layer_types=[...] to be set.")
-        targets = filter_by_type(all_infos, layer_types)
+        filtered     = filter_by_type(all_infos, layer_types)
+        targets = [i.name for i in filtered]
 
     elif mode == "auto":
         if x is None or edge_index is None:
@@ -151,13 +164,15 @@ def gnn_remat(
                 "mode='auto' requires sample x and edge_index tensors "
                 "for one-shot profiling."
             )
-        targets = _heuristic_select(
+        selected = _heuristic_select(
             all_infos,
             x=x,
             edge_index=edge_index,
             threshold=heuristic_threshold,
             top_k=heuristic_top_k,
         )
+        targets = [i.name for i in selected]
+        
 
     else:
         raise ValueError(
@@ -165,25 +180,34 @@ def gnn_remat(
             "Choose from: 'all', 'names', 'types', 'auto'."
         )
 
-    if not targets:
-        logger.warning(
-            "gnn_remat: mode=%r selected 0 layers — returning model unchanged.",
-            mode,
-        )
-        return model
-
-    return _apply(model, targets)
+    gran= AGGR if granularity == "aggr" else MODULE
+    return _apply_to_model(model, gran, layers=targets)
 
 
 #Convenience wrappers
 
 def remove_remat(model: nn.Module) -> nn.Module:
-    """
-    Strip all _RematConv wrappers from *model* (returns a new model).
-
-    Useful before exporting / running inference when you want a plain model.
-    """
-    return _remove(model)
+    """Strip all GNN-Remat wrappers, returning a plain model."""
+    model = copy.deepcopy(model)
+    for name, mod in list(model.named_modules()):
+        # Strip both kinds of wrapper
+        is_remat_conv = isinstance(mod, _RematConv)
+        is_remat_mp   = isinstance(mod, RematMessagePassing) and \
+                        getattr(mod, "_is_remat", False)
+        if not (is_remat_conv or is_remat_mp):
+            continue
+        parts  = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        # Restore original conv (unwrap _RematConv) or revert class
+        if is_remat_conv:
+            setattr(parent, parts[-1], mod.conv)
+        else:
+            # Revert dynamic class to base class
+            base_cls = type(mod).__mro__[2]  # skip RematMP, ConvRemat -> ConvClass
+            mod.__class__ = base_cls
+    return model
 
 
 def detect(model: nn.Module) -> List[LayerInfo]:
