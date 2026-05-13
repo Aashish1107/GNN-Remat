@@ -3,6 +3,7 @@ import copy, pytest, torch, torch.nn as nn
 from torch_geometric.nn import GCNConv, SAGEConv, GATConv
 from gnn_remat import gnn_remat, remove_remat, detect
 from gnn_remat.core.wrapper import _RematConv
+from gnn_remat.core.remat_mp import RematMessagePassing
 
 
 class ThreeLayer(nn.Module):
@@ -22,7 +23,15 @@ def _graph(n=40, f=8, e=120):
     return x, ei
 
 
-def _count_remat(m): return sum(1 for _, mod in m.named_modules() if isinstance(mod, _RematConv))
+def _is_remat_wrapped(mod):
+    """Check if a module is wrapped with either _RematConv or RematMessagePassing."""
+    if isinstance(mod, _RematConv):
+        return True
+    return isinstance(mod, RematMessagePassing) and getattr(mod, "_is_remat", False)
+
+
+def _count_remat(m): 
+    return sum(1 for _, mod in m.named_modules() if _is_remat_wrapped(mod))
 
 
 # Mode: all
@@ -36,7 +45,7 @@ def test_mode_all_does_not_mutate_original():
 # Mode: names
 def test_mode_names_wraps_only_specified():
     remat = gnn_remat(ThreeLayer(), mode="names", layers=["conv1"])
-    assert isinstance(remat.conv1, _RematConv)
+    assert _is_remat_wrapped(remat.conv1)
     assert isinstance(remat.conv2, SAGEConv)
 
 def test_mode_names_missing_layers_raises():
@@ -46,7 +55,7 @@ def test_mode_names_missing_layers_raises():
 # Mode: types
 def test_mode_types_wraps_only_matching():
     remat = gnn_remat(ThreeLayer(), mode="types", layer_types=[GCNConv])
-    assert isinstance(remat.conv1, _RematConv)
+    assert _is_remat_wrapped(remat.conv1)
     assert isinstance(remat.conv2, SAGEConv)
 
 def test_mode_types_missing_types_raises():
