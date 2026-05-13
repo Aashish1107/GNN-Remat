@@ -7,4 +7,5 @@ __pycache__/
 
 #Distribution / packaging files to ignore
 build/
-*.egg-info/
+*.egg-info
+/dataset
