@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 import torch
+import traceback
 
 from .models import build
 from .profiler import compare
@@ -40,9 +41,21 @@ def run_one(model_name: str, args, device):
         hidden=args.hidden,
         out_channels=args.classes,
         num_layers=args.layers,
+        heads=args.heads,
     )
-    x, edge_index = _make_graph(args.nodes, args.degree, args.features, device)
-
+    # Build the graph on CPU first so an OOM here doesn't kill the whole
+    # --all run — compare() will move tensors to device itself.
+    graph_device = device if device.type == "cpu" else torch.device("cpu")
+    try:
+        x, edge_index = _make_graph(args.nodes, args.degree, args.features, graph_device)
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if "out of memory" not in str(e).lower() and not isinstance(
+            e, getattr(torch.cuda, "OutOfMemoryError", ())
+        ):
+            raise
+        print(f"  [skip] could not allocate graph tensors: {e}")
+        return None
+ 
     result = compare(model, x, edge_index, num_epochs=args.epochs, device=device)
     print(result.summary())
     return result
@@ -72,6 +85,33 @@ def main(argv=None):
     for name in models_to_run:
         run_one(name, args, device)
 
+    # One row per model in the final summary, so --all is legible at a glance.
+    overview: list[tuple[str, str]] = []
+    for name in models_to_run:
+        try:
+            result = run_one(name, args, device)
+        except Exception as e:                      # noqa: BLE001
+            # An unexpected failure in one model should not stop --all.
+            traceback.print_exc()
+            overview.append((name, f"error: {type(e).__name__}"))
+            continue
+ 
+        if result is None:
+            overview.append((name, "skipped (graph alloc failed)"))
+            continue
+ 
+        rows = [result.baseline, result.module_ckpt, result.gnn_remat]
+        ok = sum(1 for r in rows if r.ok)
+        oom_labels = [r.label for r in rows if not r.ok]
+        if oom_labels:
+            overview.append((name, f"{ok}/3 ok · OOM: {', '.join(oom_labels)}"))
+        else:
+            overview.append((name, "3/3 ok"))
+ 
+    if len(models_to_run) > 1:
+        print(f"\n{'─'*64}\nRun summary")
+        for name, status in overview:
+            print(f"  {name.upper():<10} {status}")
 
 if __name__ == "__main__":
     main()

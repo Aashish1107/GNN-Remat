@@ -76,6 +76,7 @@ def score_layers(
 
     for info in infos:
         module = info.module
+        was_training = module.training
         module.eval()
 
         # Resolve the correct input dimension for this layer.
@@ -85,15 +86,16 @@ def score_layers(
             in_ch = x.size(-1)
 
         # Build a synthetic input tensor with the right feature dimension.
-        probe_x = torch.zeros(x.size(0), in_ch)
+        probe_x = torch.zeros(x.size(0), in_ch, device=x.device)
 
         with torch.no_grad():
             try:
                 out = module(probe_x, edge_index)
             except Exception:
                 # Skip layers that can't run (e.g. unusual signatures)
+                module.train(was_training)
                 continue
-
+        module.train(was_training)
         output_bytes   = out.numel() * out.element_size()
         # Scatter-add cost: each edge contributes one addition per feature
         recompute_flops = max(num_edges * out.size(-1), 1)

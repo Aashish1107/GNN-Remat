@@ -13,6 +13,7 @@ Public API
 from __future__ import annotations
 
 import gc
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -31,9 +32,16 @@ class ProfileResult:
     peak_memory_mb: float
     epoch_time_ms: float
     epochs_run: int
+    status: str = "ok"
+
+    @property
+    def ok(self)-> bool:
+        return self.status == "ok"
 
     @property
     def throughput(self) -> float:
+        if not self.ok or self.epoch_time_ms <= 0:
+            return float("nan")
         """Epochs per second."""
         return self.epochs_run / (self.epoch_time_ms * self.epochs_run / 1000)
 
@@ -47,16 +55,41 @@ class CompareResult:
 
     def summary(self) -> str:
         rows = [self.baseline, self.module_ckpt, self.gnn_remat]
+ 
+        # Use the first successful row as the reference for "Mem saved".
+        # Normally that's the baseline; when baseline OOMs we fall back to
+        # module-checkpoint so the GNN-Remat saving is still legible.
+        reference = next((r for r in rows if r.ok), None)
+        ref_is_baseline = reference is self.baseline
+        saved_header = "Mem saved" if (reference is None or ref_is_baseline) else "Mem saved*"
+ 
         lines = [
-            f"{'Condition':<22}  {'Peak Mem (MB)':>14}  {'Epoch (ms)':>11}  {'Mem saved':>10}",
+            f"{'Condition':<22}  {'Peak Mem (MB)':>14}  "
+            f"{'Epoch (ms)':>11}  {saved_header:>10}",
             "-" * 64,
         ]
-        base_mem = self.baseline.peak_memory_mb
         for r in rows:
-            saved = (1 - r.peak_memory_mb / base_mem) * 100 if base_mem > 0 else 0
+            if not r.ok:
+                lines.append(
+                    f"{r.label:<22}  {'OOM':>14}  {'OOM':>11}  {'—':>10}"
+                )
+                continue
+            if reference is None or reference.peak_memory_mb <= 0:
+                lines.append(
+                    f"{r.label:<22}  {r.peak_memory_mb:>14.1f}  "
+                    f"{r.epoch_time_ms:>11.1f}  {'—':>10}"
+                )
+            else:
+                saved = (1 - r.peak_memory_mb / reference.peak_memory_mb) * 100
+                lines.append(
+                    f"{r.label:<22}  {r.peak_memory_mb:>14.1f}  "
+                    f"{r.epoch_time_ms:>11.1f}  {saved:>9.1f}%"
+                )
+ 
+        if reference is not None and not ref_is_baseline:
             lines.append(
-                f"{r.label:<22}  {r.peak_memory_mb:>14.1f}  "
-                f"{r.epoch_time_ms:>11.1f}  {saved:>9.1f}%"
+                f"  * Mem saved is vs. {reference.label} "
+                f"(baseline OOM'd at this configuration)."
             )
         return "\n".join(lines)
 
@@ -77,6 +110,23 @@ def _peak_memory_mb() -> float:
         return torch.cuda.max_memory_allocated() / 1024 ** 2
     return 0.0
 
+def _is_oom(exc: BaseException) -> bool:
+    if hasattr(torch.cuda, "OutOfMemoryError") and isinstance(
+        exc, torch.cuda.OutOfMemoryError
+    ):
+        return True
+    if not isinstance(exc, (RuntimeError, MemoryError)):
+        return False
+    msg = str(exc).lower()
+    return any(needle in msg for needle in (
+        "out of memory",
+        "cuda error: out of memory",
+        "cublas_status_alloc_failed",
+        "cudnn_status_not_initialized",
+        "not enough memory",
+        "alloc_cpu",
+        "cannot allocate memory",
+    ))
 
 def profile(
     model: nn.Module,
@@ -113,36 +163,86 @@ def profile(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+    model_dev: Optional[nn.Module] = None
+    x_dev: Optional[torch.Tensor] = None
+    ei_dev: Optional[torch.Tensor] = None
+    optimizer: Optional[torch.optim.Optimizer] = None
+ 
+    try:
+        model_dev = model.to(device).train()
+        x_dev = x.to(device)
+        ei_dev = edge_index.to(device)
+        optimizer = torch.optim.Adam(model_dev.parameters(), lr=1e-3)
+ 
+        def _step():
+            optimizer.zero_grad()
+            out = model_dev(x_dev, ei_dev)
+            loss = out.sum() if criterion is None else criterion(out)
+            loss.backward()
+            optimizer.step()
+ 
+        # Warmup (not measured). OOM here is still OOM — same handling.
+        for _ in range(warmup):
+            _step()
+ 
+        # Measured run.
+        _reset_memory()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(num_epochs):
+            _step()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+ 
+        return ProfileResult(
+            label=label,
+            peak_memory_mb=_peak_memory_mb(),
+            epoch_time_ms=elapsed_ms / num_epochs,
+            epochs_run=num_epochs,
+            status="ok",
+        )
+ 
+    except BaseException as exc:
+        if not _is_oom(exc):
+            raise
+        # Drop refs before empty_cache, otherwise the allocator still
+        # holds the blocks and the next condition inherits the pressure.
+        model_dev = None
+        x_dev = None
+        ei_dev = None
+        optimizer = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return ProfileResult(
+            label=label,
+            peak_memory_mb=float("nan"),
+            epoch_time_ms=float("nan"),
+            epochs_run=0,
+            status="OOM",
+        )
+ 
+    finally:
+        # Belt-and-suspenders cleanup on both the happy path and any
+        # non-OOM error. Setting locals to None drops profile()'s refs;
+        # the caller may still hold a reference to the original model.
+        model_dev = None
+        x_dev = None
+        ei_dev = None
+        optimizer = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    model = model.to(device).train()
-    x = x.to(device)
-    edge_index = edge_index.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    def _step():
-        optimizer.zero_grad()
-        out = model(x, edge_index)
-        loss = out.sum() if criterion is None else criterion(out)
-        loss.backward()
-        optimizer.step()
-
-    # Warmup
-    for _ in range(warmup):
-        _step()
-
-    # Measured run
-    _reset_memory()
-    t0 = time.perf_counter()
-    for _ in range(num_epochs):
-        _step()
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-
-    return ProfileResult(
-        label=label,
-        peak_memory_mb=_peak_memory_mb(),
-        epoch_time_ms=elapsed_ms / num_epochs,
-        epochs_run=num_epochs,
-    )
+def _between_conditions():
+    """Aggressive memory reclamation between benchmark conditions."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 def compare(
@@ -177,12 +277,15 @@ def compare(
     from torch_geometric.nn import MessagePassing
 
     # ── Condition 1: Baseline ────────────────────────────────────────────────
+    base_model = copy.deepcopy(model)
     base_result = profile(
-        copy.deepcopy(model), x, edge_index,
+        base_model, x, edge_index,
         label="Baseline (PyG)",
         num_epochs=num_epochs,
         device=device,
     )
+    del base_model
+    _between_conditions()
 
     # ── Condition 2: Module-level checkpoint ─────────────────────────────────
     module_model = copy.deepcopy(model)
@@ -219,6 +322,8 @@ def compare(
         num_epochs=num_epochs,
         device=device,
     )
+    del remat_model
+    _between_conditions()
 
     return CompareResult(
         baseline=base_result,
