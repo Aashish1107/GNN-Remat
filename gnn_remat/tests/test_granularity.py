@@ -82,17 +82,20 @@ def test_baseline_calls_each_once():
 def test_aggr_granularity_reruns_propagate():
     """
     granularity='aggr': propagate() is checkpointed, so both message() and
-    aggregate() are called twice (forward + recompute during backward).
+    aggregate() are recomputed during backward.
 
-    The distinction from 'module' granularity is *what* is recomputed:
+      message_calls   == 2  (forward + recompute inside propagate checkpoint)
+      aggregate_calls == 2  (forward + recompute inside propagate checkpoint)
+
+    The distinction from 'module' granularity is *what else* is recomputed:
       aggr   — recomputes only propagate() (message + scatter)
       module — recomputes the full layer forward(), including any linear
                projections that the model applies before propagate()
+               (e.g. GATConv.lin_src / lin_dst)
 
-    InstrumentedGCN has its linear inside message() so both modes show
-    the same message/aggregate call counts here. The cost difference is
-    only visible when a model has expensive ops outside propagate()
-    (e.g. GATConv's lin_src / lin_dst).
+    InstrumentedGCN has its linear inside message() so both modes show the
+    same call counts here.  The real cost difference is visible when a model
+    applies expensive projections outside propagate().
     """
     conv = InstrumentedGCN(8, 16)
 
@@ -112,7 +115,7 @@ def test_aggr_granularity_reruns_propagate():
     x, ei = _graph()
     model(x.clone().requires_grad_(True), ei).sum().backward()
 
-    # Both run twice: once in the forward pass, once during recompute
+    # Both run twice: forward + recompute during propagate backward
     assert inner.message_calls == 2, \
         f"aggr mode: message() should run 2x (forward+recompute), ran {inner.message_calls}x"
     assert inner.aggregate_calls == 2, \

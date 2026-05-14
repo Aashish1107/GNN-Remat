@@ -83,24 +83,19 @@ def main(argv=None):
     print(f"Device: {device}")
 
     models_to_run = ["gcn", "graphsage", "gat"] if args.all else [args.model]
-    for name in models_to_run:
-        run_one(name, args, device)
-
-    # One row per model in the final summary, so --all is legible at a glance.
     overview: list[tuple[str, str]] = []
     for name in models_to_run:
         try:
             result = run_one(name, args, device)
         except Exception as e:                      # noqa: BLE001
-            # An unexpected failure in one model should not stop --all.
             traceback.print_exc()
             overview.append((name, f"error: {type(e).__name__}"))
             continue
- 
+
         if result is None:
             overview.append((name, "skipped (graph alloc failed)"))
             continue
- 
+
         rows = [result.baseline, result.module_ckpt, result.gnn_remat]
         ok = sum(1 for r in rows if r.ok)
         oom_labels = [r.label for r in rows if not r.ok]
@@ -108,7 +103,7 @@ def main(argv=None):
             overview.append((name, f"{ok}/3 ok · OOM: {', '.join(oom_labels)}"))
         else:
             overview.append((name, "3/3 ok"))
- 
+
     if len(models_to_run) > 1:
         print(f"\n{'─'*64}\nRun summary")
         for name, status in overview:
