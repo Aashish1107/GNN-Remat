@@ -313,6 +313,8 @@ def compare(
         num_epochs=num_epochs,
         device=device,
     )
+    del module_model
+    _between_conditions()
 
     # ── Condition 3: GNN-Remat ───────────────────────────────────────────────
     remat_model = gnn_remat(copy.deepcopy(model))
