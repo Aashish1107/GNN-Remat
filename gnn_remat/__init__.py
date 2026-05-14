@@ -3,15 +3,14 @@ gnn_remat
 ---------
 Aggregation-granular rematerialization for PyTorch Geometric.
 
-Two usage styles
-----------------
-Functional (original API):
+Three usage styles
+------------------
+Functional (one-liner):
     from gnn_remat import gnn_remat
-    model = gnn_remat(model)
-    model = gnn_remat(model, mode="aggr")    # checkpoint scatter only
-    model = gnn_remat(model, mode="module")  # checkpoint full layer
+    model = gnn_remat(model)                 # propagate-level checkpoint, all layers
+    model = gnn_remat(model, granularity="module")  # full-layer checkpoint
 
-DSL / declarative (new, stronger claim):
+DSL / declarative (class decorator):
     import gnn_remat.core.dsl as remat
 
     @remat.checkpoint
@@ -20,7 +19,19 @@ DSL / declarative (new, stronger claim):
     @remat.checkpoint(granularity="aggr", layers=["conv1"])
     class MyGCN(nn.Module): ...
 
-    model = remat.checkpoint.apply(model, granularity="aggr")
+Layer annotation (policy at definition):
+    class MyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = remat.layer(GCNConv(16, 64))
+            self.conv2 = remat.layer(GATConv(64, 8, heads=4))
+
+Composable rules:
+    @remat.checkpoint(rules=[
+        remat.when_type(GATConv, granularity="aggr"),
+        remat.when_type(GCNConv, skip=True),
+    ])
+    class MyMixedGNN(nn.Module): ...
 """
 
 from __future__ import annotations
@@ -38,8 +49,6 @@ from .core.heuristic import select as _heuristic_select
 from .core.dsl import _apply_to_model, AGGR, MODULE
 from .core.wrapper import _RematConv
 from .core.remat_mp import RematMessagePassing
-from .core.transform import apply as _apply
-from .core.transform import remove as _remove
 
 __version__ = "0.2.0"
 __all__     = ["gnn_remat", "remove_remat", "detect", "LayerInfo"]
@@ -104,7 +113,9 @@ def gnn_remat(
         Sample graph connectivity for mode="auto" profiling.
 
     heuristic_threshold : float
-        Score cutoff for mode="auto".  Default 1.0.
+        Minimum estimated bytes saved for a layer to be selected in
+        mode="auto".  Default 1.0 (any positive estimate qualifies).
+        Pass a larger value, e.g. 1e6, to require at least 1 MB savings.
 
     heuristic_top_k : int, optional
         Maximum layers to select in mode="auto".

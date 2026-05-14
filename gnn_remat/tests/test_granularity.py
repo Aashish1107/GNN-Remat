@@ -223,3 +223,72 @@ def test_dsl_apply_method():
         if hasattr(mod, "_is_remat"):
             return   # found one — pass
     assert False, "No remat module found after apply()"
+
+
+def test_dsl_layer_annotation():
+    """remat.layer() wraps a single conv at definition time."""
+    import gnn_remat.core.dsl as remat
+
+    class AnnotatedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = remat.layer(GCNConv(8, 16))
+            self.conv2 = GCNConv(16, 4)   # NOT wrapped
+        def forward(self, x, ei):
+            return self.conv2(self.conv1(x, ei).relu(), ei)
+
+    model = AnnotatedModel()
+    assert isinstance(model.conv1, RematMessagePassing), \
+        "conv1 should be a RematMessagePassing after remat.layer()"
+    assert not isinstance(model.conv2, RematMessagePassing), \
+        "conv2 should remain a plain GCNConv"
+
+    # Correctness: gradients should still flow
+    x, ei = _graph()
+    model.train()
+    model(x.clone().requires_grad_(True), ei).sum().backward()
+
+
+def test_dsl_when_type_rule():
+    """when_type() selects only layers matching the given class."""
+    import gnn_remat.core.dsl as remat
+
+    class TwoConvModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gcn  = GCNConv(8, 16)
+            self.gat  = GATConv(16, 4, heads=1, concat=False)
+        def forward(self, x, ei):
+            return self.gat(self.gcn(x, ei).relu(), ei)
+
+    model = TwoConvModel()
+    wrapped = remat.checkpoint.apply(model, rules=[
+        remat.when_type(GATConv, granularity="aggr"),
+        remat.when_type(GCNConv, skip=True),
+    ])
+
+    assert isinstance(wrapped.gat, RematMessagePassing), \
+        "GAT layer should be wrapped"
+    assert not isinstance(wrapped.gcn, RematMessagePassing), \
+        "GCN layer should be skipped"
+
+
+def test_dsl_when_name_rule():
+    """when_name() selects the layer with the given dotted name."""
+    import gnn_remat.core.dsl as remat
+
+    class TwoConvModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = GCNConv(8, 16)
+            self.conv2 = GCNConv(16, 4)
+        def forward(self, x, ei):
+            return self.conv2(self.conv1(x, ei).relu(), ei)
+
+    model = TwoConvModel()
+    wrapped = remat.checkpoint.apply(model, rules=[
+        remat.when_name("conv1", granularity="aggr"),
+    ])
+
+    assert isinstance(wrapped.conv1, RematMessagePassing), "conv1 should be wrapped"
+    assert not isinstance(wrapped.conv2, RematMessagePassing), "conv2 should not be wrapped"

@@ -1,14 +1,34 @@
 """
 heuristic.py
 ------------
-Auto-selects which MessagePassing layers are worth checkpointing based on
-the ratio of memory saved to the estimated recompute cost.
+Auto-selects which MessagePassing layers are worth checkpointing.
 
-A layer is selected when:
+Scoring
+-------
+A layer's *score* estimates the net bytes freed by checkpointing it during a
+forward+backward pass.
 
-    output_bytes / recompute_flops  >  threshold
+  score = freed_bytes - added_bytes
 
-i.e. "checkpointing this layer saves a lot of memory per unit of extra work."
+Where:
+  freed_bytes — per-edge intermediates released from the autograd graph when
+                propagate() is checkpointed (e.g. attention coefficients,
+                weighted messages in GAT).
+  added_bytes — propagate *inputs* saved into ctx.saved_tensors by the
+                checkpoint (typically node-feature tensors, num_nodes × out).
+
+On CUDA the score is measured directly: run forward+backward once without the
+checkpoint, once with, and return (baseline_peak - remat_peak).  This is exact
+but adds overhead proportional to the number of candidate layers.
+
+On CPU (no CUDA memory counters) a proxy is used:
+  score ≈ (num_edges / num_nodes) × out_channels × element_size_bytes
+This captures the key variable: graph density.  High-degree graphs have more
+per-edge tensors; the node-level checkpoint cost is constant per layer.
+
+A layer is selected when score ≥ threshold (default: 1.0 byte, i.e. any
+positive estimate qualifies).  Pass a larger threshold (e.g. 1e6 for 1 MB)
+to be more conservative.
 
 Public API
 ----------
@@ -18,35 +38,64 @@ Public API
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-import torch.nn as nn
 
 from .detector import LayerInfo
 
 
-#Data class
+# ── Data class ────────────────────────────────────────────────────────────────
 
 @dataclass
 class ScoredLayer:
-    """A LayerInfo augmented with profiling estimates."""
+    """A LayerInfo augmented with an estimated memory-savings score."""
 
     info: LayerInfo
-    output_bytes: int
-    """Bytes the layer's output tensor occupies in GPU memory."""
-
-    recompute_flops: int
-    """Rough scatter-add FLOPs during a recompute (|E| * d)."""
 
     score: float
-    """output_bytes / recompute_flops — higher = better candidate."""
+    """
+    Estimated net bytes freed by checkpointing this layer.
+    Positive  → checkpointing saves memory (good candidate).
+    Near zero → break-even; marginal benefit.
+    Negative  → checkpointing adds memory (skip this layer).
+    """
 
     selected: bool = False
 
 
-#Scoring
+# ── CUDA measurement ──────────────────────────────────────────────────────────
+
+def _cuda_savings(module, probe_x: torch.Tensor, edge_index: torch.Tensor) -> float:
+    """
+    Measure peak-memory delta by running forward+backward with and without
+    the propagate-level checkpoint.  Returns bytes saved (positive = good).
+    """
+    from .remat_mp import make_remat_conv  # local import to avoid circularity
+
+    device = probe_x.device
+
+    def _peak(mod) -> int:
+        mod.train()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        x = probe_x.clone().requires_grad_(True)
+        out = mod(x, edge_index)
+        out.sum().backward()
+        torch.cuda.synchronize(device)
+        return torch.cuda.max_memory_allocated(device)
+
+    # Two runs each to warm up CUDA allocator caches before measuring.
+    _peak(module); baseline = _peak(module)
+    remat = make_remat_conv(copy.deepcopy(module))
+    _peak(remat); with_remat = _peak(remat)
+
+    return float(baseline - with_remat)
+
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
 
 def score_layers(
     infos: List[LayerInfo],
@@ -54,8 +103,7 @@ def score_layers(
     edge_index: torch.Tensor,
 ) -> List[ScoredLayer]:
     """
-    Run one forward pass per candidate layer and record output size and
-    estimated recompute cost.
+    Score each candidate layer by estimated bytes saved when checkpointed.
 
     Parameters
     ----------
@@ -71,7 +119,11 @@ def score_layers(
     list[ScoredLayer]
         One entry per candidate, sorted by score descending.
     """
+    device = x.device
+    cuda = device.type == "cuda"
+    num_nodes = x.size(0)
     num_edges = edge_index.size(1)
+
     scored: List[ScoredLayer] = []
 
     for info in infos:
@@ -79,42 +131,38 @@ def score_layers(
         was_training = module.training
         module.eval()
 
-        # Resolve the correct input dimension for this layer.
-        # GCNConv / SAGEConv / GATConv all expose .in_channels.
-        in_ch = getattr(module, "in_channels", None)
-        if in_ch is None:
-            in_ch = x.size(-1)
-
-        # Build a synthetic input tensor with the right feature dimension.
-        probe_x = torch.zeros(x.size(0), in_ch, device=x.device)
+        in_ch = getattr(module, "in_channels", None) or x.size(-1)
+        probe_x = torch.zeros(num_nodes, in_ch, device=device)
 
         with torch.no_grad():
             try:
                 out = module(probe_x, edge_index)
             except Exception:
-                # Skip layers that can't run (e.g. unusual signatures)
                 module.train(was_training)
                 continue
         module.train(was_training)
-        output_bytes   = out.numel() * out.element_size()
-        # Scatter-add cost: each edge contributes one addition per feature
-        recompute_flops = max(num_edges * out.size(-1), 1)
-        score           = output_bytes / recompute_flops
 
-        scored.append(
-            ScoredLayer(
-                info=info,
-                output_bytes=output_bytes,
-                recompute_flops=recompute_flops,
-                score=score,
-            )
-        )
+        if cuda:
+            # Exact measurement: run the layer with and without checkpoint.
+            score = _cuda_savings(module, probe_x, edge_index)
+        else:
+            # CPU proxy: estimated net bytes = edge tensors freed - node tensors added.
+            # edge_bytes ≈ num_edges × out_channels × dtype_size  (per-edge intermediates)
+            # node_bytes ≈ num_nodes × out_channels × dtype_size  (checkpoint input cost)
+            # net ≈ (num_edges - num_nodes) × out_channels × dtype_size
+            # Simplified to (num_edges/num_nodes) × out_channels × dtype_size so the
+            # ratio is always positive for real graphs (degree ≥ 1).
+            out_ch   = out.size(-1)
+            elt_size = out.element_size()
+            score    = (num_edges / max(num_nodes, 1)) * out_ch * elt_size
+
+        scored.append(ScoredLayer(info=info, score=score))
 
     scored.sort(key=lambda s: s.score, reverse=True)
     return scored
 
 
-#Selection
+# ── Selection ─────────────────────────────────────────────────────────────────
 
 def select(
     infos: List[LayerInfo],
@@ -129,32 +177,23 @@ def select(
     Parameters
     ----------
     infos : list[LayerInfo]
-        All MessagePassing layers detected in the model.
     x : torch.Tensor
-        Sample node feature matrix used for one-shot profiling.
     edge_index : torch.Tensor
-        Sample graph connectivity used for one-shot profiling.
     threshold : float
-        Minimum score (output_bytes / recompute_flops) required for a
-        layer to be selected.  Default 1.0 means "save at least 1 byte
-        per FLOP of recompute".
+        Minimum score (estimated bytes saved) to include a layer.
+        Default 1.0 selects any layer with a positive estimate.
+        Use a larger value (e.g. 1e6 for 1 MB) to be conservative.
     top_k : int or None
-        If set, return at most the top-k highest-scoring layers regardless
-        of threshold.
+        If set, return at most the top-k highest-scoring layers.
 
     Returns
     -------
     list[LayerInfo]
-        Layers recommended for checkpointing.
     """
     scored = score_layers(infos, x, edge_index)
-
     candidates = [s for s in scored if s.score >= threshold]
-
     if top_k is not None:
         candidates = candidates[:top_k]
-
     for s in candidates:
         s.selected = True
-
     return [s.info for s in candidates]

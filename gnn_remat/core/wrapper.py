@@ -47,6 +47,9 @@ class _RematConv(nn.Module):
         self.conv = conv
 
     def forward(self, *args, **kwargs):
+        if not self.training:
+            return self.conv(*args, **kwargs)
+
         # torch.utils.checkpoint does not support keyword arguments
         # directly, so we bind them into a closure.
         if kwargs:
