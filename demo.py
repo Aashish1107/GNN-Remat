@@ -22,7 +22,7 @@ from gnn_remat.core.wrapper import _RematConv
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# -- helpers -------------------------------------------------------------------
 
 def _sep(title: str) -> None:
     print(f"\n{'='*64}")
@@ -61,7 +61,7 @@ def _check_grads(base: nn.Module, rmt: nn.Module,
     print(f"    gradient parity: {status}")
 
 
-# ── shared model definitions ──────────────────────────────────────────────────
+# -- shared model definitions --------------------------------------------------
 
 class SimpleGCN(nn.Module):
     def __init__(self):
@@ -94,8 +94,8 @@ class MixedGNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.embed   = nn.Linear(32, 64)
-        self.sage    = SAGEConv(64, 64)          # no attention — skip remat
-        self.attn    = GATConv(64, 32, heads=4)  # attention — benefits from remat
+        self.sage    = SAGEConv(64, 64)          # no attention - skip remat
+        self.attn    = GATConv(64, 32, heads=4)  # attention - benefits from remat
         self.readout = nn.Linear(128, 16)
 
     def forward(self, x, edge_index):
@@ -109,18 +109,18 @@ x, ei = _graph()  # shared input for correctness checks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — Functional API  (gnn_remat)
+# SECTION 1 - Functional API  (gnn_remat)
 # Best for: one-off wrapping, scripts, quick experiments.
-# The original model is never mutated — gnn_remat() always returns a deep copy.
+# The original model is never mutated - gnn_remat() always returns a deep copy.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_sep("1. Functional API — gnn_remat()")
+_sep("1. Functional API - gnn_remat()")
 
 # 1a. mode='all' (default): checkpoint every MessagePassing layer
 model   = SimpleGAT().to(DEVICE)
 wrapped = gnn_remat(model)          # model is unchanged; wrapped is a new object
 n_remat = sum(isinstance(m, RematMessagePassing) for _, m in wrapped.named_modules())
-print("1a. mode='all' (default) — wraps every MP layer:")
+print("1a. mode='all' (default) - wraps every MP layer:")
 print(f"    layers checkpointed: {n_remat}")
 _check_grads(model, wrapped, x, ei)   # model still has original weights
 
@@ -130,7 +130,7 @@ wrapped = gnn_remat(model, mode="names", layers=["conv1", "conv3"])
 names   = [n for n, m in wrapped.named_modules() if isinstance(m, RematMessagePassing)]
 print(f"\n1b. mode='names', layers=['conv1','conv3']: wrapped = {names}")
 
-# 1c. mode='types': target by class — useful for heterogeneous models
+# 1c. mode='types': target by class - useful for heterogeneous models
 model   = MixedGNN().to(DEVICE)
 wrapped = gnn_remat(model, mode="types", layer_types=[GATConv])
 names   = [n for n, m in wrapped.named_modules() if isinstance(m, RematMessagePassing)]
@@ -154,14 +154,14 @@ print(f"\n1e. mode='auto' (heuristic): selected {auto_names}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — Class decorator  (@remat.checkpoint)
+# SECTION 2 - Class decorator  (@remat.checkpoint)
 # Best for: research code where you own the model source.
 # Policy is declared at class level and applied automatically at __init__.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_sep("2. Class decorator — @remat.checkpoint")
+_sep("2. Class decorator - @remat.checkpoint")
 
-# 2a. Bare decorator — applies aggr granularity to every MP layer
+# 2a. Bare decorator - applies aggr granularity to every MP layer
 @remat.checkpoint
 class DecoratedGAT(nn.Module):
     def __init__(self):
@@ -188,13 +188,13 @@ x2 = x.clone().requires_grad_(True)
 model_dec.train(); model_dec(x2, ei).sum().backward()
 print(f"    backward completed successfully (no error = correct)")
 
-# 2b. Parameterised decorator — selective wrapping by layer name
+# 2b. Parameterised decorator - selective wrapping by layer name
 @remat.checkpoint(granularity="aggr", layers=["conv1"])
 class SelectiveGCN(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv1 = GCNConv(32, 64)
-        self.conv2 = GCNConv(64, 16)  # stays vanilla — avoids overhead
+        self.conv2 = GCNConv(64, 16)  # stays vanilla - avoids overhead
 
     def forward(self, x, edge_index):
         return self.conv2(F.relu(self.conv1(x, edge_index)), edge_index)
@@ -204,7 +204,7 @@ print(f"\n2b. @remat.checkpoint(layers=['conv1']):")
 print(f"    conv1 checkpointed: {isinstance(model_sel.conv1, RematMessagePassing)}")
 print(f"    conv2 plain:        {not isinstance(model_sel.conv2, RematMessagePassing)}")
 
-# 2c. module granularity decorator — for comparison with aggr
+# 2c. module granularity decorator - for comparison with aggr
 @remat.checkpoint(granularity="module")
 class FullCheckpointGCN(nn.Module):
     def __init__(self):
@@ -221,12 +221,12 @@ print(f"\n2c. @remat.checkpoint(granularity='module'): {n_mod} full-layer wrappe
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — Layer annotation  (remat.layer)
-# Best for: new model code. Policy lives next to the layer definition —
+# SECTION 3 - Layer annotation  (remat.layer)
+# Best for: new model code. Policy lives next to the layer definition -
 # no post-hoc transformation of the whole model needed.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_sep("3. Layer annotation — remat.layer()")
+_sep("3. Layer annotation - remat.layer()")
 
 class AnnotatedGNN(nn.Module):
     """
@@ -238,7 +238,7 @@ class AnnotatedGNN(nn.Module):
         # Attention layer: propagate-level checkpoint frees per-edge tensors
         self.attn1 = remat.layer(GATConv(32, 32, heads=4))
 
-        # Simple aggregation: no checkpoint — overhead not worth it here
+        # Simple aggregation: no checkpoint - overhead not worth it here
         self.sage  = SAGEConv(128, 64)
 
         # Explicit granularity at definition
@@ -251,7 +251,7 @@ class AnnotatedGNN(nn.Module):
         return self.attn2(x, edge_index)
 
 model_ann = AnnotatedGNN().to(DEVICE)
-print("3.  remat.layer() — inline annotation:")
+print("3.  remat.layer() - inline annotation:")
 print(f"    attn1 checkpointed : {isinstance(model_ann.attn1, RematMessagePassing)}")
 print(f"    sage  plain        : {not isinstance(model_ann.sage, RematMessagePassing)}")
 print(f"    attn2 checkpointed : {isinstance(model_ann.attn2, RematMessagePassing)}")
@@ -262,12 +262,12 @@ print(f"    backward completed successfully")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — Composable rules  (when_type / when_name)
+# SECTION 4 - Composable rules  (when_type / when_name)
 # Best for: mixed-architecture models where different layer types need
-# different policies.  Rules resolve by first match — order matters.
+# different policies.  Rules resolve by first match - order matters.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_sep("4. Composable rules — when_type() / when_name()")
+_sep("4. Composable rules - when_type() / when_name()")
 
 # 4a. Type-based rules: checkpoint attention, skip everything else
 model = MixedGNN().to(DEVICE)
@@ -292,7 +292,7 @@ print(f"    conv1: {type(wrapped.conv1).__name__:<22} (module-level checkpoint)"
 print(f"    conv2: {type(wrapped.conv2).__name__:<22} (skipped)")
 print(f"    conv3: {type(wrapped.conv3).__name__:<22} (propagate-level checkpoint)")
 
-# 4c. Rules via class decorator — most expressive pattern.
+# 4c. Rules via class decorator - most expressive pattern.
 #     The memory policy is part of the class definition itself; no caller
 #     needs to know which layers to wrap.
 @remat.checkpoint(rules=[
@@ -312,37 +312,37 @@ class PolicyInClass(nn.Module):
         return self.post(x, edge_index)
 
 model_pic = PolicyInClass().to(DEVICE)
-print("\n4c. @remat.checkpoint(rules=[...]) — policy declared in the class:")
+print("\n4c. @remat.checkpoint(rules=[...]) - policy declared in the class:")
 print(f"    pre  (GCNConv) skipped  : {not isinstance(model_pic.pre,  RematMessagePassing)}")
 print(f"    attn (GATConv) wrapped  : {isinstance(model_pic.attn, RematMessagePassing)}")
 print(f"    post (GCNConv) skipped  : {not isinstance(model_pic.post, RematMessagePassing)}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — Inspection utilities  (detect / remove_remat)
+# SECTION 5 - Inspection utilities  (detect / remove_remat)
 # Best for: debugging, auditing, progressive adoption in existing code.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_sep("5. Inspection — detect() / remove_remat()")
+_sep("5. Inspection - detect() / remove_remat()")
 
-# 5a. detect() before wrapping — see what gnn_remat() would touch
+# 5a. detect() before wrapping - see what gnn_remat() would touch
 model = MixedGNN().to(DEVICE)
 infos = detect(model)
 print("5a. detect() on plain MixedGNN:")
 for info in infos:
     print(f"    {info.name:<20}  {type(info.module).__name__}")
 
-# 5b. detect() after wrapping — confirm which layers got checkpointed
+# 5b. detect() after wrapping - confirm which layers got checkpointed
 wrapped = gnn_remat(model, mode="types", layer_types=[GATConv])
 print("\n5b. detect() after gnn_remat(mode='types', layer_types=[GATConv]):")
 for info in detect(wrapped):
     tag = "[remat]" if isinstance(info.module, RematMessagePassing) else "[plain]"
     print(f"    {info.name:<20}  {type(info.module).__name__:<22} {tag}")
 
-# 5c. remove_remat() — strip everything and get the original architecture back
+# 5c. remove_remat() - strip everything and get the original architecture back
 #     Useful for: saving checkpoints, switching to production mode, ablations.
 restored = remove_remat(wrapped)
-print("\n5c. remove_remat() — all wrappers stripped:")
+print("\n5c. remove_remat() - all wrappers stripped:")
 for info in detect(restored):
     print(f"    {info.name:<20}  {type(info.module).__name__}")
 
@@ -358,12 +358,12 @@ print(f"    After selective wrap: {wrapped_names}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — Eval-mode guard
+# SECTION 6 - Eval-mode guard
 # Best for: verifying that inference does NOT pay the recompute overhead.
-# The guard is inside RematMessagePassing.propagate() — no user action needed.
+# The guard is inside RematMessagePassing.propagate() - no user action needed.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_sep("6. Inference — eval-mode guard")
+_sep("6. Inference - eval-mode guard")
 
 class CountingGCN(GCNConv):
     """GCNConv that counts how many times message() is called."""
@@ -395,18 +395,18 @@ train_calls = rmt_conv.message_calls
 print(f"Training: message() called {train_calls}x  "
       f"(1 forward + 1 recompute during backward)")
 
-# Eval: checkpoint is skipped entirely — message() runs exactly once
+# Eval: checkpoint is skipped entirely - message() runs exactly once
 rmt_conv.eval(); rmt_conv.message_calls = 0
 rmt_model.eval()
 with torch.no_grad():
     rmt_model(x_sm, ei_sm)
 eval_calls = rmt_conv.message_calls
 print(f"Eval:     message() called {eval_calls}x  "
-      f"(guard active — no checkpoint overhead)")
+      f"(guard active - no checkpoint overhead)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — Memory comparison  (CUDA only)
+# SECTION 7 - Memory comparison  (CUDA only)
 # Shows the actual trade-off: aggr saves more memory than baseline while
 # staying faster than module-level checkpoint.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -414,7 +414,7 @@ print(f"Eval:     message() called {eval_calls}x  "
 _sep("7. Memory comparison (CUDA)")
 
 if DEVICE.type != "cuda":
-    print("  (no CUDA — skipping memory comparison)")
+    print("  (no CUDA - skipping memory comparison)")
 else:
     def _profile(label: str, model: nn.Module,
                  x: torch.Tensor, ei: torch.Tensor) -> float:
@@ -428,34 +428,34 @@ else:
         print(f"    {label:<30}  peak = {peak:7.1f} MB")
         return peak
 
-    # GAT: attention stores large per-edge tensors — high benefit
+    # GAT: attention stores large per-edge tensors - high benefit
     x_g, ei_g = _graph(n=2000, f=32, avg_deg=15)
-    print("\n  GAT (attention model — best case for remat):")
+    print("\n  GAT (attention model - best case for remat):")
     gat_base = SimpleGAT()
     b = _profile("baseline",            gat_base,                              x_g, ei_g)
     m = _profile("module checkpoint",   gnn_remat(copy.deepcopy(gat_base), granularity="module"), x_g, ei_g)
     r = _profile("gnn_remat (aggr)",    gnn_remat(copy.deepcopy(gat_base), granularity="aggr"),   x_g, ei_g)
-    print(f"    savings — module: {(b-m)/b*100:+.1f}%   remat: {(b-r)/b*100:+.1f}%")
+    print(f"    savings - module: {(b-m)/b*100:+.1f}%   remat: {(b-r)/b*100:+.1f}%")
 
-    # GCN: no per-edge attention tensors — small overhead at small scale
-    print("\n  GCN (no attention — small-graph overhead):")
+    # GCN: no per-edge attention tensors - small overhead at small scale
+    print("\n  GCN (no attention - small-graph overhead):")
     gcn_base = SimpleGCN()
     b = _profile("baseline",            gcn_base,                              x_g, ei_g)
     m = _profile("module checkpoint",   gnn_remat(copy.deepcopy(gcn_base), granularity="module"), x_g, ei_g)
     r = _profile("gnn_remat (aggr)",    gnn_remat(copy.deepcopy(gcn_base), granularity="aggr"),   x_g, ei_g)
-    print(f"    savings — module: {(b-m)/b*100:+.1f}%   remat: {(b-r)/b*100:+.1f}%")
+    print(f"    savings - module: {(b-m)/b*100:+.1f}%   remat: {(b-r)/b*100:+.1f}%")
     print("    (overhead closes at 50K+ nodes as edge tensors dominate)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — Decision guide
+# SECTION 8 - Decision guide
 # ══════════════════════════════════════════════════════════════════════════════
 
-_sep("8. Decision guide — which pattern to use")
+_sep("8. Decision guide - which pattern to use")
 
 print("""
   SITUATION                                  RECOMMENDED PATTERN
-  ─────────────────────────────────────────────────────────────────────
+  ---------------------------------------------------------------------
   Quick experiment / training script        gnn_remat(model)
 
   Want automatic layer selection            gnn_remat(model, mode='auto',
@@ -482,8 +482,8 @@ print("""
   (frees per-edge attention tensors)        ~17% peak memory reduction
 
   GCN / SAGE at < 20K nodes                 Consider skipping remat, or use
-  (no large per-edge tensors to free)        mode='auto' — heuristic may skip them
-  ─────────────────────────────────────────────────────────────────────
+  (no large per-edge tensors to free)        mode='auto' - heuristic may skip them
+  ---------------------------------------------------------------------
 """)
 
 print("demo.py complete.")
