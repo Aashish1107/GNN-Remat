@@ -88,6 +88,8 @@ gnn_remat/
 │   │                    checkpoint that frees per-edge tensors while
 │   │                    keeping linear projections in the autograd graph.
 │   │                    make_remat_conv() injects via dynamic subclass.
+│   │                    Also hosts SAR-inspired destination-node chunked
+│   │                    propagation (_propagate_chunked) for large graphs.
 │   │
 │   ├── wrapper.py    ← Module-level checkpoint (_RematConv).
 │   │                    Wraps the whole layer with use_reentrant=False.
@@ -96,28 +98,27 @@ gnn_remat/
 │   ├── dsl.py        ← User-facing DSL: @remat.checkpoint decorator,
 │   │                    remat.layer() inline annotation, when_type() /
 │   │                    when_name() composable rules, first-match resolution.
+│   │                    Threads chunk_nodes through every entry point.
 │   │
 │   ├── detector.py   ← Finds all MessagePassing layers in any model.
-│   │                    Returns LayerInfo(name, module) for each.
+│   │                    Returns LayerInfo(name, module, parent, attr).
 │   │
-│   ├── transform.py  ← Applies wrappers to a model copy. remove() strips them.
-│   │
-│   ├── heuristic.py  ← Auto-selects layers by measured memory savings.
-│   │                    CUDA: measures actual peak delta (baseline vs remat).
-│   │                    CPU: graph-density proxy in bytes.
-│   │
-│   └── replacer.py   ← Lower-level replace with RematReport (name, before, after).
+│   └── heuristic.py  ← Auto-selects layers by measured/estimated savings
+│                        (SAR Case-1/Case-2 aware) and computes a safe
+│                        chunk_nodes via auto_chunk_size().
 │
 ├── benchmark/
-│   ├── profiler.py   ← Measures peak GPU memory + throughput per config.
-│   ├── models.py     ← GCN, GraphSAGE, GAT reference models for benchmarking.
-│   └── runner.py     ← CLI: --model gat --nodes 5000 --all
+│   ├── profiler.py   ← Measures peak GPU memory + throughput per config
+│   │                    (baseline, module ckpt, GNN-Remat, +Chunk).
+│   ├── models.py     ← GCN, GraphSAGE, GAT, GraphTransformer reference models.
+│   └── runner.py     ← CLI: --model gat --nodes 5000 --all --chunk-nodes auto
 │
-├── tests/            ← 47 tests across 5 files
+├── tests/            ← 77 tests across 6 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py           ← Full feature tour of all four DSL styles
-└── __init__.py       ← Public API: gnn_remat(), detect(), remove_remat()
+└── __init__.py       ← Public API: gnn_remat(), detect(), remove_remat(),
+                         auto_chunk_size()
 ```
 
 ---
@@ -172,6 +173,38 @@ model = gnn_remat(model)          # one line — propagate-level checkpoint
 out = model(x, edge_index)
 out.sum().backward()
 ```
+
+## SAR-inspired chunked propagation (large graphs)
+
+Propagate-level checkpointing frees per-edge tensors *for the backward pass*, but
+they are still fully allocated during the forward pass. On a large full-batch
+graph that forward-pass spike is what causes OOM. **Chunked propagation** (ported
+from [SAR, arXiv 2111.06483](https://arxiv.org/abs/2111.06483) to a single GPU)
+processes edges in destination-node windows, so only one window's edge tensors
+are ever live at once — cutting peak edge memory from `O(total_edges × F)` to
+`O(chunk_edges × F)`.
+
+Edges are grouped by **destination node**, so every node's complete neighbourhood
+lands in exactly one chunk. That keeps sum / mean / max **and attention-softmax**
+numerically correct (the softmax denominator always spans the full neighbourhood).
+
+```python
+from gnn_remat import gnn_remat, auto_chunk_size
+
+# Pick a chunk size from available GPU memory (or pass an explicit int)
+chunk = auto_chunk_size(num_nodes=50_000, out_channels=256, num_heads=4)
+model = gnn_remat(model, chunk_nodes=chunk)
+
+# Works through every DSL surface too:
+import gnn_remat.core.dsl as remat
+self.attn = remat.layer(GATConv(64, 8, heads=4), chunk_nodes=chunk)
+model     = remat.checkpoint.apply(model, chunk_nodes=chunk)
+```
+
+Chunking is gated to training mode and to layers with more edges than
+`chunk_nodes`, so inference and small graphs pay nothing. It benefits attention
+layers (GAT, Transformer) most; for GCN/SAGE the saving is smaller and may be
+outweighed by per-chunk overhead at small scale.
 
 ## How to use
 
@@ -377,9 +410,10 @@ model = remat.checkpoint.apply(my_model, rules=[
 | Situation | Recommendation |
 |---|---|
 | GAT / attention GNN | `gnn_remat(model)` — significant savings |
+| Graph so large the forward pass OOMs | `gnn_remat(model, chunk_nodes=auto_chunk_size(...))` — caps peak edge memory |
 | GCN / SAGE, large graph (50K+ nodes) | `gnn_remat(model)` — savings grow with edge count |
-| GCN / SAGE, small graph (< 20K nodes) | Use `mode="auto"` — heuristic may skip layers with no benefit |
-| Mixed model (some attention, some plain) | `when_type(GATConv)` + `when_type(GCNConv, skip=True)` |
+| GCN / SAGE, small graph (< 20K nodes) | Use `mode="auto"` — skips layers with no benefit |
+| Mixed model (some attention, some plain) | `mode="auto"`, or `when_type(GATConv)` + `when_type(GCNConv, skip=True)` |
 | Unknown model, want to be safe | `detect(model)` first, then `mode="auto"` |
 
 ## Run tests
@@ -388,14 +422,21 @@ model = remat.checkpoint.apply(my_model, rules=[
 python run_tests.py
 ```
 
-Runs all 47 tests.
+Runs all 77 tests.
 
 ## Benchmarks
 
 ```bash
 python -m gnn_remat.benchmark.runner --model gat --nodes 5000
 python -m gnn_remat.benchmark.runner --all --nodes 5000
-python -m gnn_remat.benchmark.runner --model gat --nodes 50000   # scale sweep
+python -m gnn_remat.benchmark.runner --model gat --scale            # scale sweep
+
+# SAR-inspired chunked propagation adds a 4th "GNN-Remat+Chunk" condition:
+python -m gnn_remat.benchmark.runner --model gat --nodes 50000 --chunk-nodes 5000
+python -m gnn_remat.benchmark.runner --model gat --scale --chunk-nodes auto
+
+# Find the graph size where the baseline OOMs but GNN-Remat still fits (CUDA):
+python -m gnn_remat.benchmark.runner --model gat --find-limit --chunk-nodes auto
 ```
 
 ## Project layout
@@ -403,16 +444,17 @@ python -m gnn_remat.benchmark.runner --model gat --nodes 50000   # scale sweep
 ```
 gnn_remat/
 ├── core/
-│   ├── remat_mp.py    # RematMessagePassing — propagate-level checkpoint (novel)
+│   ├── remat_mp.py    # RematMessagePassing — propagate-level checkpoint +
+│   │                  #   SAR-inspired destination-node chunked propagation (novel)
 │   ├── wrapper.py     # _RematConv — full-layer checkpoint (module granularity)
 │   ├── dsl.py         # @remat.checkpoint, remat.layer(), when_type(), when_name()
 │   ├── detector.py    # finds MessagePassing modules in any model
-│   └── heuristic.py   # auto-selects layers by measured/estimated memory savings
+│   └── heuristic.py   # auto-selects layers (SAR Case-1/2 aware) + auto_chunk_size()
 ├── benchmark/
 │   ├── profiler.py    # measures peak GPU memory + throughput
-│   ├── models.py      # GCN, GraphSAGE, GAT reference models
-│   └── runner.py      # CLI entry point
-├── tests/             # 47 tests across 5 files
+│   ├── models.py      # GCN, GraphSAGE, GAT, GraphTransformer reference models
+│   └── runner.py      # CLI entry point (--chunk-nodes N|auto)
+├── tests/             # 77 tests across 6 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py            # full feature tour of all four DSL styles
@@ -423,21 +465,29 @@ gnn_remat/
 
 Items known to be missing or worth improving, roughly in priority order.
 
+**Recently done**
+
+- **GAT gradient parity** — covered by `test_gradient_parity_gat` (public API) and
+  the GAT gradient tests in `test_chunked.py` (incl. chunked propagation).
+- **`mode="auto"` selectivity on CPU** — the proxy now estimates *net* savings
+  (`freed − added`) per SAR Case 1/2, so GCN/SAGE score negative and are skipped
+  while dense attention layers are selected. See `core/heuristic.py`.
+
 **Correctness gaps**
 
-- **GAT gradient test** — `test_aggr_gradients_match_baseline` covers GCNConv only.
-  A matching test for GATConv (with multi-head attention and softmax) would catch
-  any edge case in `_flatten_kwargs` when attention tensors flow through the checkpoint.
-
 - **Bipartite graph test** — `propagate()` accepts `x=(x_src, x_dst)` tuple inputs
-  for bipartite graphs.  `_flatten_kwargs` handles the tuple case but there is no test
-  that exercises this path end-to-end.
+  for bipartite graphs.  `_flatten_kwargs` / `_slice_edge_kwargs` handle the tuple
+  case but no test exercises this path end-to-end; the shape-based per-edge
+  detection in `_slice_edge_kwargs` is most likely to misfire here.
 
-- **`mode="auto"` on CPU always selects all layers** — the CPU proxy formula
-  `(num_edges / num_nodes) × out_ch × element_size` is always positive for any real
-  graph (average degree ≥ 1), so the heuristic never skips a layer on CPU.
-  A model-type check (does the layer have attention coefficients?) would make
-  `mode="auto"` genuinely selective on CPU too.
+- **Chunked propagation under attention dropout** — chunked correctness tests use
+  `eval()` / dropout-free convs.  In `train()` each chunk is a separate checkpoint
+  with its own RNG, so a chunked run will not reproduce a non-chunked run's dropout
+  mask. The contract (bitwise-equal only in eval) should be pinned by a test.
+
+- **`flow="target_to_source"`** — `_propagate_chunked` hard-codes destinations as
+  `edge_index[1]`. Layers built with `flow="target_to_source"` would chunk the wrong
+  row and silently compute incomplete neighbourhoods. Needs handling or an assert.
 
 **Missing features**
 
@@ -445,15 +495,18 @@ Items known to be missing or worth improving, roughly in priority order.
   layers greedily until the budget is met.  Currently users must reason about
   `heuristic_threshold` in raw bytes, which is less intuitive.
 
-- **Per-layer granularity auto-detection** — layers with attention attributes
-  (`att`, `alpha`, `lin_src`/`lin_dst`) benefit from `granularity="aggr"`;
-  plain aggregation layers (GCN, SAGE) benefit from `granularity="module"` or no
-  checkpoint.  An auto mode that detects this per layer would remove the need for
-  manual `when_type()` rules in mixed models.
+- **Per-layer granularity auto-detection** — selection is now SAR-aware, but every
+  selected layer still uses the same `granularity`. Attention layers want `"aggr"`;
+  GCN/SAGE want `"module"` or `chunk_nodes`. Choosing granularity *per layer* would
+  remove the need for manual `when_type()` rules in mixed models.
 
-- **`detect()` output enrichment** — `LayerInfo` currently exposes only `name` and
-  `module`.  Adding `has_attention: bool` and `param_count: int` would make the
-  inspect-before-wrap workflow much more informative.
+- **Sort-based chunking** — `_propagate_chunked` re-masks all edges per window
+  (`O(num_chunks × E)`). Sorting edges by destination once would make each chunk a
+  contiguous slice (`O(E log E)` once), removing the main chunked-path overhead.
+
+- **`detect()` output enrichment** — `LayerInfo` exposes `name, module, parent,
+  attr`. Adding `has_attention: bool` and `param_count: int` would make the
+  inspect-before-wrap workflow more informative.
 
 **Compatibility**
 
