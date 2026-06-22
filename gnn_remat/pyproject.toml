@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gnn-remat"
-version = "0.1.0"
-description = "Aggregation-granular rematerialization for PyTorch Geometric"
+version = "0.3.0"
+description = "Aggregation-granular rematerialization for PyTorch Geometric, with SAR-inspired destination-node chunked propagation for large-graph memory efficiency."
 requires-python = ">=3.9"
 dependencies = ["torch>=2.0", "torch_geometric>=2.3"]
 
@@ -19,3 +19,31 @@ gnn-remat-bench = "gnn_remat.benchmark.runner:main"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+
+# ── Changelog ──────────────────────────────────────────────────────────────────
+# v0.3.0 — SAR-inspired improvements
+#   • Destination-node chunked propagation (_propagate_chunked):
+#       processes edges in contiguous dst-node windows so only one chunk's
+#       edge tensors are live at a time. Reduces peak memory from
+#       O(total_edges × F) to O(chunk_edges × F).
+#   • Per-edge kwargs slicing (_slice_edge_kwargs):
+#       correctly handles PyG >= 2.x layers (GATConv, TransformerConv) that
+#       pre-compute per-edge tensors (alpha) before calling propagate().
+#   • auto_chunk_size(): computes a GPU-memory-aware chunk_nodes value.
+#   • SAR Case-1/Case-2 heuristic: attention layers scored 3.5× higher than
+#       non-attention layers in mode="auto", matching SAR's classification.
+#   • chunk_nodes parameter threaded through gnn_remat(), DSL decorator,
+#       remat.checkpoint.apply(), and remat.layer().
+#   • 27 new tests (test_chunked.py); all 74 tests pass.
+#
+# v0.2.0 — DSL surface
+#   • remat.checkpoint class decorator
+#   • remat.layer() inline annotation
+#   • remat.when_type() / remat.when_name() composable rules
+#   • mode="auto" heuristic layer selection
+#
+# v0.1.0 — initial release
+#   • RematMessagePassing: propagate()-level gradient checkpoint
+#   • make_remat_conv() factory
+#   • gnn_remat() functional API (modes: all, names, types)
+#   • _RematConv module-level wrapper (baseline comparison)
