@@ -22,21 +22,27 @@ On CUDA the score is measured directly: run forward+backward once without the
 checkpoint, once with, and return (baseline_peak - remat_peak).  This is exact
 but adds overhead proportional to the number of candidate layers.
 
-On CPU (no CUDA memory counters) a SAR-aware proxy is used:
+On CPU (no CUDA memory counters) a SAR-aware proxy estimates the NET bytes
+saved, score = freed_bytes - added_bytes:
 
   Attention layers (GAT, Transformer) — SAR Case 2:
-    Gradients need x_j AND alpha during backward → large per-edge footprint.
-    Proxy multiplier: 3.5× (alpha ~ 1 head-scalar per edge on top of x_j).
+    Baseline autograd retains x_j [E, out] AND alpha [E, heads] for the
+    attention-weighted backward, so checkpointing frees E×(out+heads) and
+    re-saves only the inputs N×out:
+        score = E×(out + heads)×size - N×out×size      (positive when dense)
 
   Non-attention layers (GCN, SAGE) — SAR Case 1:
     scatter_add backward only needs d_agg and edge_index; baseline PyTorch
-    does NOT save the messages tensor.  Checkpointing ADDS the checkpoint
-    input cost.  Proxy multiplier: 0.6× (scores are smaller, selected only
-    when graph density is high).
+    does NOT save the messages tensor, so there is nothing to free.
+    Checkpointing only ADDS the input cost:
+        score = -N×out×size                            (always negative)
+    These are skipped by mode="auto"; use granularity="module" or chunk_nodes
+    to reduce their memory instead.
 
-A layer is selected when score ≥ threshold (default: 1.0 byte, i.e. any
-positive estimate qualifies).  Pass a larger threshold (e.g. 1e6 for 1 MB)
-to be more conservative.
+A layer is selected when score ≥ threshold (default: 1.0 byte).  Under the
+net-savings model GCN/SAGE fall below threshold (negative) and are skipped,
+while dense attention layers qualify.  Pass a larger threshold (e.g. 1e6 for
+1 MB) to be more conservative.
 
 auto_chunk_size()
 -----------------
@@ -206,25 +212,37 @@ def score_layers(
             score = _cuda_savings(module, probe_x, edge_index)
         else:
             # ── SAR-aware CPU proxy ───────────────────────────────────────────
-            # Baseline formula (original):
-            #   score ≈ (num_edges / num_nodes) × out_channels × dtype_size
-            # This is always positive for degree ≥ 1, which caused mode="auto"
-            # to always select all layers — including GCN/SAGE where savings are
-            # negative at small scale.
+            # Estimate NET bytes saved = freed_bytes - added_bytes, modelling
+            # SAR's Case-1 / Case-2 distinction directly.
             #
-            # SAR improvement: apply a Case-1 / Case-2 multiplier.
-            #   Case 2 (attention): large per-edge footprint (alpha + x_j × heads)
-            #     → multiplier 3.5×  (clearly worth checkpointing at any density)
-            #   Case 1 (no attention): only x_j, scatter backward is free in
-            #     baseline PyTorch → checkpointing may ADD overhead at low density
-            #     → multiplier 0.6×  (selected only when density is high enough
-            #        to overcome the checkpoint-input cost)
+            # The previous proxy scaled a single always-positive term
+            #   (num_edges / num_nodes) × out × dtype_size
+            # by 3.5× / 0.6×.  Because that term is positive for any average
+            # degree ≥ 1, even 0.6× of it stayed above the default 1.0-byte
+            # threshold, so mode="auto" still selected GCN/SAGE on CPU — exactly
+            # the layers where propagate-checkpoint ADDS memory.  Modelling the
+            # net delta makes the heuristic genuinely selective.
             out_ch   = out.size(-1)
             elt_size = out.element_size()
-            base     = (num_edges / max(num_nodes, 1)) * out_ch * elt_size
+            added    = num_nodes * out_ch * elt_size   # propagate inputs re-saved
 
-            attn_mult = 3.5 if _is_attention_based(module) else 0.6
-            score = base * attn_mult
+            if _is_attention_based(module):
+                # Case 2 (GAT, Transformer): baseline autograd MUST retain the
+                # per-edge message x_j [E, out] and attention logits alpha
+                # [E, heads] to backprop the attention-weighted aggregation.
+                # Checkpointing frees both, re-saving only the inputs [N, out]:
+                #   score = E*(out + heads) - N*out   (positive when dense)
+                heads = int(getattr(module, "heads", 1) or 1)
+                freed = num_edges * (out_ch + heads) * elt_size
+                score = float(freed - added)
+            else:
+                # Case 1 (GCN, SAGE): scatter_add backward needs only the
+                # upstream gradient + edge_index, so baseline never stores the
+                # messages.  Nothing is freed; checkpointing propagate() only
+                # ADDS the input cost [N, out] → net negative.  These are skipped
+                # by mode="auto"; use granularity="module" or chunk_nodes to cut
+                # their memory instead.
+                score = float(-added)
 
         scored.append(ScoredLayer(info=info, score=score))
 
