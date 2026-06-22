@@ -313,10 +313,12 @@ def auto_chunk_size(
     num_nodes : int
         Total number of nodes in the graph.  The returned value is capped here.
     out_channels : int
-        Output feature dimension of the GNN layer.  Determines the size of x_j.
+        PER-HEAD output feature dimension of the GNN layer.  The per-edge message
+        width is num_heads × out_channels (each head materialises its own x_j
+        before concat/average), so pass the per-head dim and the real heads count.
     num_heads : int
         Number of attention heads (1 for non-attention layers like GCN/SAGE).
-        Determines the size of alpha per edge.
+        Scales both x_j and alpha per edge.
     avg_degree : float
         Average number of incoming edges per node.  Used to convert an edge
         memory budget to a node chunk budget.  Default 10 is conservative for
@@ -361,8 +363,15 @@ def auto_chunk_size(
             pass
 
     # ── Per-edge cost ─────────────────────────────────────────────────────────
-    # x_j  : [out_channels] floats per edge   (gathered source features)
-    # alpha : [num_heads]   floats per edge    (attention coefficients)
+    # x_j   : [num_heads, out_channels] floats per edge  (gathered source feats)
+    # alpha : [num_heads]               floats per edge   (attention coefficients)
+    #
+    # out_channels is the PER-HEAD output dimension.  A multi-head attention layer
+    # materialises x_j for every head before concat/average, so the message width
+    # is num_heads × out_channels — NOT out_channels.  The previous formula used
+    # (out_channels + num_heads), which under-counted concat attention by ~num_heads
+    # and produced chunks too large to hit the memory target.  For num_heads=1
+    # (GCN/SAGE) this reduces to ~out_channels as before.
     elt_size: dict[torch.dtype, int] = {
         torch.float64:  8,
         torch.float32:  4,
@@ -370,7 +379,7 @@ def auto_chunk_size(
         torch.bfloat16: 2,
     }
     bytes_per_elt  = elt_size.get(dtype, 4)
-    bytes_per_edge = (out_channels + num_heads) * bytes_per_elt
+    bytes_per_edge = (out_channels * num_heads + num_heads) * bytes_per_elt
 
     # ── Convert edge budget → node budget ─────────────────────────────────────
     edge_budget = max(budget // bytes_per_edge, 1)
