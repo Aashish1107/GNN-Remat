@@ -1,14 +1,20 @@
 """
 gnn_remat
 ---------
-Aggregation-granular rematerialization for PyTorch Geometric.
+Aggregation-granular rematerialization for PyTorch Geometric,
+with SAR-inspired chunked propagation for large-graph memory efficiency.
 
 Three usage styles
 ------------------
 Functional (one-liner):
-    from gnn_remat import gnn_remat
-    model = gnn_remat(model)                 # propagate-level checkpoint, all layers
-    model = gnn_remat(model, granularity="module")  # full-layer checkpoint
+    from gnn_remat import gnn_remat, auto_chunk_size
+
+    model = gnn_remat(model)                          # propagate-level checkpoint, all layers
+    model = gnn_remat(model, granularity="module")    # full-layer checkpoint (baseline)
+
+    # SAR-inspired: chunk by destination-node batches
+    chunk = auto_chunk_size(num_nodes=50_000, out_channels=256, num_heads=4)
+    model = gnn_remat(model, chunk_nodes=chunk)
 
 DSL / declarative (class decorator):
     import gnn_remat.core.dsl as remat
@@ -16,7 +22,7 @@ DSL / declarative (class decorator):
     @remat.checkpoint
     class MyGAT(nn.Module): ...
 
-    @remat.checkpoint(granularity="aggr", layers=["conv1"])
+    @remat.checkpoint(granularity="aggr", layers=["conv1"], chunk_nodes=5000)
     class MyGCN(nn.Module): ...
 
 Layer annotation (policy at definition):
@@ -24,7 +30,8 @@ Layer annotation (policy at definition):
         def __init__(self):
             super().__init__()
             self.conv1 = remat.layer(GCNConv(16, 64))
-            self.conv2 = remat.layer(GATConv(64, 8, heads=4))
+            self.conv2 = remat.layer(GATConv(64, 8, heads=4),
+                                     chunk_nodes=auto_chunk_size(N, 256, num_heads=4))
 
 Composable rules:
     @remat.checkpoint(rules=[
@@ -45,15 +52,22 @@ from torch_geometric.nn import MessagePassing
 
 from .core.detector import LayerInfo, detect as _detect
 from .core.detector import filter_by_name, filter_by_type
-from .core.heuristic import select as _heuristic_select
+from .core.heuristic import select as _heuristic_select, auto_chunk_size
 from .core.dsl import _apply_to_model, AGGR, MODULE
 from .core.wrapper import _RematConv
 from .core.remat_mp import RematMessagePassing
 
-__version__ = "0.2.0"
-__all__     = ["gnn_remat", "remove_remat", "detect", "LayerInfo"]
+__version__ = "0.3.0"
+__all__     = [
+    "gnn_remat",
+    "remove_remat",
+    "detect",
+    "auto_chunk_size",
+    "LayerInfo",
+]
 
 logger = logging.getLogger(__name__)
+
 
 def gnn_remat(
     model: nn.Module,
@@ -66,6 +80,7 @@ def gnn_remat(
     edge_index: Optional[torch.Tensor] = None,
     heuristic_threshold: float = 1.0,
     heuristic_top_k: Optional[int] = None,
+    chunk_nodes: Optional[int] = None,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -85,7 +100,9 @@ def gnn_remat(
         * ``"types"``  — only layers whose class is in *layer_types*.
         * ``"auto"``   — heuristic: select layers where memory saving
                          justifies recompute cost.  Requires *x* and
-                         *edge_index*.
+                         *edge_index*.  SAR-aware: attention layers (GAT,
+                         Transformer) are scored 3.5× higher than
+                         non-attention layers (GCN, SAGE).
 
     granularity : {"aggr", "module"}
         What to checkpoint:
@@ -99,7 +116,7 @@ def gnn_remat(
         "module"
             Checkpoints the entire MessagePassing layer (linear + attention +
             scatter). Same as torch.utils.checkpoint. Provided for comparison.
-                                              
+
     layers : list[str], optional
         Dotted layer names for mode="names", e.g. ["conv1", "enc.conv2"].
 
@@ -120,6 +137,30 @@ def gnn_remat(
     heuristic_top_k : int, optional
         Maximum layers to select in mode="auto".
 
+    chunk_nodes : int, optional
+        SAR-inspired chunked propagation.  When set, each selected layer
+        processes only *chunk_nodes* destination nodes' edges at a time,
+        reducing peak memory from O(total_edges × F) to O(chunk_edges × F).
+
+        This mirrors SAR's sequential partition processing on a single GPU:
+        each destination-node chunk contains ALL edges for those nodes, so
+        every aggregation type (sum, mean, max, attention softmax) is computed
+        correctly over complete neighbourhoods.
+
+        Each chunk is independently checkpointed, so edge tensors are freed
+        both during the forward pass (by chunking) and during the backward
+        pass (by recomputation).
+
+        Use ``auto_chunk_size()`` to compute a safe value from available
+        GPU memory::
+
+            from gnn_remat import gnn_remat, auto_chunk_size
+            chunk = auto_chunk_size(num_nodes, out_channels=256, num_heads=4)
+            model = gnn_remat(model, chunk_nodes=chunk)
+
+        Default None disables chunking (standard checkpoint only).
+        Ignored when granularity="module".
+
     verbose : bool
         If True, log each layer that gets wrapped.
 
@@ -135,12 +176,15 @@ def gnn_remat(
 
     Examples
     --------
-    >>> model = gnn_remat(model)          
-    >>> model = gnn_remat(model, granularity="module")  # module-level baseline
-    >>> model = gnn_remat(model, layers=["conv1"])         # by name
-    >>> model = gnn_remat(model, layer_types=[GATConv])    # by type
-    >>> model = gnn_remat(model, mode="auto",              # heuristic
+    >>> model = gnn_remat(model)
+    >>> model = gnn_remat(model, granularity="module")       # module-level baseline
+    >>> model = gnn_remat(model, layers=["conv1"])           # by name
+    >>> model = gnn_remat(model, layer_types=[GATConv])      # by type
+    >>> model = gnn_remat(model, mode="auto",                # heuristic
     ...                   x=x, edge_index=edge_index)
+    >>> # SAR-inspired chunked propagation:
+    >>> chunk = auto_chunk_size(50_000, out_channels=256, num_heads=4)
+    >>> model = gnn_remat(model, chunk_nodes=chunk)
     """
     if verbose:
         logging.basicConfig(level=logging.INFO)
@@ -154,7 +198,7 @@ def gnn_remat(
         )
         return model
 
-    #Select target layers based on mode
+    # ── Select target layers based on mode ────────────────────────────────────
     if mode == "all":
         targets = None  # _apply_to_model treats None as "all"
 
@@ -166,8 +210,8 @@ def gnn_remat(
     elif mode == "types":
         if not layer_types:
             raise ValueError("mode='types' requires layer_types=[...] to be set.")
-        filtered     = filter_by_type(all_infos, layer_types)
-        targets = [i.name for i in filtered]
+        filtered = filter_by_type(all_infos, layer_types)
+        targets  = [i.name for i in filtered]
 
     elif mode == "auto":
         if x is None or edge_index is None:
@@ -183,7 +227,6 @@ def gnn_remat(
             top_k=heuristic_top_k,
         )
         targets = [i.name for i in selected]
-        
 
     else:
         raise ValueError(
@@ -191,11 +234,11 @@ def gnn_remat(
             "Choose from: 'all', 'names', 'types', 'auto'."
         )
 
-    gran= AGGR if granularity == "aggr" else MODULE
-    return _apply_to_model(model, gran, layers=targets)
+    gran = AGGR if granularity == "aggr" else MODULE
+    return _apply_to_model(model, gran, layers=targets, chunk_nodes=chunk_nodes)
 
 
-#Convenience wrappers
+# ── Convenience wrappers ──────────────────────────────────────────────────────
 
 def remove_remat(model: nn.Module) -> nn.Module:
     """Strip all GNN-Remat wrappers, returning a plain model."""

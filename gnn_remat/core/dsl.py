@@ -48,7 +48,7 @@ Public API
 from __future__ import annotations
 
 import copy
-from typing import List, Optional, Sequence, Type
+from typing import List, Optional, Sequence, Type, Union
 
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
@@ -61,6 +61,9 @@ from .wrapper  import wrap
 
 AGGR   = "aggr"    # checkpoint propagate()            (novel, this project)
 MODULE = "module"  # checkpoint full layer forward()   (baseline comparison)
+
+# Sentinel so callers can omit chunk_nodes without triggering chunking
+_NO_CHUNK: Optional[int] = None
 
 
 # ── Composable rules ──────────────────────────────────────────────────────────
@@ -141,7 +144,11 @@ def when_name(layer_name: str, *, granularity: str = AGGR, skip: bool = False) -
 
 # ── Layer-level annotation ────────────────────────────────────────────────────
 
-def layer(conv: nn.Module, granularity: str = AGGR) -> nn.Module:
+def layer(
+    conv: nn.Module,
+    granularity: str = AGGR,
+    chunk_nodes: Optional[int] = None,
+) -> nn.Module:
     """
     Wrap a single MessagePassing layer at the point of definition.
 
@@ -155,6 +162,11 @@ def layer(conv: nn.Module, granularity: str = AGGR) -> nn.Module:
     granularity : {"aggr", "module"}
         "aggr"   — checkpoint propagate() only  (default, recommended)
         "module" — checkpoint the full layer forward
+    chunk_nodes : int, optional
+        Enable SAR-inspired chunked propagation.  Only this many destination
+        nodes' edges are materialised at once, reducing peak memory from
+        O(E×F) to O(chunk×F).  Requires granularity="aggr".
+        Use auto_chunk_size() from heuristic.py to pick a value.
 
     Returns
     -------
@@ -163,15 +175,19 @@ def layer(conv: nn.Module, granularity: str = AGGR) -> nn.Module:
 
     Example
     -------
+    >>> from gnn_remat import auto_chunk_size
     >>> class MyModel(nn.Module):
     ...     def __init__(self):
     ...         super().__init__()
     ...         self.conv1 = remat.layer(GCNConv(16, 64))
-    ...         self.conv2 = remat.layer(GATConv(64, 8, heads=4))
+    ...         self.conv2 = remat.layer(GATConv(64, 8, heads=4),
+    ...                                  chunk_nodes=auto_chunk_size(N, 256, num_heads=4))
     """
     if not isinstance(conv, MessagePassing):
         return conv
-    return make_remat_conv(conv) if granularity == AGGR else wrap(conv)
+    if granularity == AGGR:
+        return make_remat_conv(conv, chunk_nodes=chunk_nodes)
+    return wrap(conv)
 
 
 # ── Internal transform ────────────────────────────────────────────────────────
@@ -182,14 +198,15 @@ def _apply_to_model(
     layers:      Optional[List[str]]       = None,
     layer_types: Optional[List[type]]      = None,
     rules:       Optional[List[_Rule]]     = None,
+    chunk_nodes: Optional[int]             = None,
 ) -> nn.Module:
     """
     Deep-copy model and replace selected MessagePassing layers.
 
     Priority: rules > layer_types > layers > (all layers when none specified).
 
-    granularity="aggr"   ->  make_remat_conv()  (checkpoint propagate)
-    granularity="module" ->  wrap()              (checkpoint full layer)
+    granularity="aggr"   ->  make_remat_conv(chunk_nodes=chunk_nodes)
+    granularity="module" ->  wrap()   (chunk_nodes ignored for module-level)
     """
     model = copy.deepcopy(model)
 
@@ -222,7 +239,10 @@ def _apply_to_model(
         for p in parts[:-1]:
             parent = getattr(parent, p)
 
-        replacement = make_remat_conv(mod) if effective_gran == AGGR else wrap(mod)
+        if effective_gran == AGGR:
+            replacement = make_remat_conv(mod, chunk_nodes=chunk_nodes)
+        else:
+            replacement = wrap(mod)
         setattr(parent, parts[-1], replacement)
 
     return model
@@ -251,25 +271,29 @@ class _CheckpointDescriptor:
         layers:      Optional[List[str]]   = None,
         layer_types: Optional[List[type]]  = None,
         rules:       Optional[List[_Rule]] = None,
+        chunk_nodes: Optional[int]         = None,
     ):
         # Bare decorator: @remat.checkpoint
         if isinstance(cls_or_none, type):
             return self._decorate_class(
-                cls_or_none, granularity, layers, layer_types, rules
+                cls_or_none, granularity, layers, layer_types, rules, chunk_nodes
             )
         # Parameterised: @remat.checkpoint(granularity=...) — return a decorator
         def _decorator(cls):
-            return self._decorate_class(cls, granularity, layers, layer_types, rules)
+            return self._decorate_class(
+                cls, granularity, layers, layer_types, rules, chunk_nodes
+            )
         return _decorator
 
-    def _decorate_class(self, cls, granularity, layers, layer_types, rules):
+    def _decorate_class(self, cls, granularity, layers, layer_types, rules, chunk_nodes):
         """Wrap cls.__init__ so every instance is transformed after construction."""
         original_init = cls.__init__
 
         def patched_init(self_instance, *args, **kwargs):
             original_init(self_instance, *args, **kwargs)
             transformed = _apply_to_model(
-                self_instance, granularity, layers, layer_types, rules
+                self_instance, granularity, layers, layer_types, rules,
+                chunk_nodes=chunk_nodes,
             )
             self_instance.__dict__.update(transformed.__dict__)
 
@@ -284,6 +308,7 @@ class _CheckpointDescriptor:
         layers:      Optional[List[str]]   = None,
         layer_types: Optional[List[type]]  = None,
         rules:       Optional[List[_Rule]] = None,
+        chunk_nodes: Optional[int]         = None,
     ) -> nn.Module:
         """
         Imperatively apply rematerialization to a model instance.
@@ -297,12 +322,18 @@ class _CheckpointDescriptor:
         rules : list[_Rule], optional
             If provided, overrides layers/layer_types.  Use when_type() or
             when_name() to build rules.
+        chunk_nodes : int, optional
+            Enable SAR-inspired chunked propagation on selected layers.
+            See gnn_remat() and auto_chunk_size() for details.
 
         Returns
         -------
         nn.Module  (original unchanged)
         """
-        return _apply_to_model(model, granularity, layers, layer_types, rules)
+        return _apply_to_model(
+            model, granularity, layers, layer_types, rules,
+            chunk_nodes=chunk_nodes,
+        )
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────
