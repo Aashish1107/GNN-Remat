@@ -21,7 +21,9 @@ import copy
 import pytest
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GCNConv, GATConv, SAGEConv, MessagePassing
+from torch_geometric.nn import (
+    GCNConv, GATConv, SAGEConv, TransformerConv, MessagePassing,
+)
 
 from gnn_remat import gnn_remat, auto_chunk_size, detect
 from gnn_remat.core.remat_mp import RematMessagePassing, make_remat_conv
@@ -67,6 +69,17 @@ class _SimpleSAGE(nn.Module):
         return self.conv(x, ei)
 
 
+class _SimpleTransformer(nn.Module):
+    """TransformerConv exercises the full-size FALLBACK chunk path: it passes
+    per-dst `query` and per-src `key`/`value` (no `x`), which cannot be safely
+    local-remapped by shape on a homogeneous graph."""
+    def __init__(self, in_c=16, out_c=8, heads=2):
+        super().__init__()
+        self.conv = TransformerConv(in_c, out_c, heads=heads, concat=False)
+    def forward(self, x, ei):
+        return self.conv(x, ei)
+
+
 def _baseline_output(model_cls, x, ei, **model_kwargs):
     """Forward output of a fresh baseline model (no remat)."""
     m = model_cls(**model_kwargs)
@@ -81,6 +94,7 @@ def _baseline_output(model_cls, x, ei, **model_kwargs):
     (_SimpleGCN, {}),
     (_SimpleSAGE, {}),
     (_SimpleGAT, {"heads": 2}),
+    (_SimpleTransformer, {"heads": 2}),  # fallback (full-size) chunk path
 ])
 def test_chunked_output_matches_baseline(model_cls, kwargs):
     """
@@ -132,6 +146,7 @@ def test_chunked_output_single_chunk_equals_no_chunk():
     (_SimpleGCN, {}),
     (_SimpleSAGE, {}),
     (_SimpleGAT, {"heads": 2}),
+    (_SimpleTransformer, {"heads": 2}),  # fallback (full-size) chunk path
 ])
 def test_chunked_gradients_match_baseline(model_cls, kwargs):
     """
@@ -416,4 +431,53 @@ def test_attention_layers_score_higher_than_non_attention():
     assert "gcn" in scores, "GCN layer not found in scored layers"
     assert scores["gat"] > scores["gcn"], (
         f"GAT should score higher than GCN: GAT={scores['gat']:.0f}, GCN={scores['gcn']:.0f}"
+    )
+
+
+# ── 11. Chunk path selection: local remap vs full-size fallback ──────────────
+
+def test_can_local_remap_x_based_convs():
+    """GCN/SAGE/GAT pass only the recognised `x` node kwarg → local remap (the
+    path that removes the O(num_dst x F) scatter-output floor)."""
+    rmp = make_remat_conv(GCNConv(16, 8))
+    N, E = 50, 200
+    x = torch.randn(N, 16)
+    # single-tensor x (homogeneous)
+    assert rmp._can_local_remap({"x": x}, N, N, E) is True
+    # src/dst tuple x (bipartite-style)
+    assert rmp._can_local_remap({"x": (x, x)}, N, N, E) is True
+    # x + a per-edge kwarg (e.g. GAT alpha [E, H]) is still local-remappable
+    alpha = torch.randn(E, 2)
+    assert rmp._can_local_remap({"x": x, "alpha": alpha}, N, N, E) is True
+
+
+def test_can_local_remap_falls_back_on_unhandled_dst_kwarg():
+    """An unrecognised destination-indexed node kwarg (size == num_dst, not `x`)
+    cannot be classified by shape on a homogeneous graph → safe full-size fallback.
+    This is the TransformerConv `query` situation."""
+    rmp = make_remat_conv(GCNConv(16, 8))
+    N, E = 50, 200
+    query = torch.randn(N, 2, 8)   # per-destination-node tensor, not named `x`
+    key   = torch.randn(N, 2, 8)   # per-source-node tensor
+    assert rmp._can_local_remap(
+        {"query": query, "key": key}, N, N, E
+    ) is False
+
+
+def test_transformer_runtime_uses_fallback_and_is_correct():
+    """End-to-end: TransformerConv chunked output matches baseline even though
+    it takes the full-size fallback path (covered by the parametrized tests too,
+    asserted here explicitly for the fallback contract)."""
+    x, ei = _random_graph(num_nodes=40, num_edges=140)
+    base = _SimpleTransformer(heads=2)
+
+    x1 = x.clone().detach().requires_grad_(True); base.train()
+    base(x1, ei).sum().backward()
+
+    chunked = gnn_remat(copy.deepcopy(base), chunk_nodes=6)
+    x2 = x.clone().detach().requires_grad_(True); chunked.train()
+    chunked(x2, ei).sum().backward()
+
+    assert torch.allclose(x1.grad, x2.grad, atol=1e-4), (
+        f"Transformer fallback grad diff = {(x1.grad - x2.grad).abs().max():.2e}"
     )

@@ -119,10 +119,23 @@ class RematMessagePassing(MessagePassing):
     Mode 2 — Destination-node chunked checkpoint (SAR-inspired):
         Processes edges in chunk_nodes-wide destination-node windows.
         Each chunk is independently checkpointed.
-        Per-edge kwargs (e.g. pre-computed attention alpha) are sliced to
-        the chunk before being passed to propagate(), preventing size mismatches.
-        Reduces peak memory from O(E×F) to O(chunk_edges×F).
-        Activated when _chunk_nodes is set via make_remat_conv / gnn_remat.
+
+        Edges are sorted by destination ONCE per forward (O(E log E)), so each
+        window is a contiguous slice located via searchsorted — instead of a
+        fresh boolean mask over all E edges per window (O(num_chunks × E)).
+
+        When the layer's node-feature kwarg is the recognised `x` (GCN, SAGE,
+        GAT), destination indices are remapped to a local [0, chunk_len) range
+        and the dst features are sliced to the window, so each chunk's scatter
+        output is [chunk_len, F] rather than the full [num_dst, F].  This removes
+        the O(num_dst × F) memory floor that otherwise caps the saving (and makes
+        very small chunks regress).  Layers with other destination-indexed
+        kwargs (e.g. TransformerConv's per-dst query) fall back to the safe
+        full-size scatter + slice, still benefiting from the faster windowing.
+
+        Reduces peak edge memory from O(E×F) to O(chunk_edges×F); with the
+        local-remap path the output term drops from O(num_dst×F) to
+        O(chunk_len×F).  Activated when _chunk_nodes is set.
 
     Gate: checkpointing is skipped in eval() and when no float tensor
     requires a gradient, so inference pays zero overhead.
@@ -133,24 +146,26 @@ class RematMessagePassing(MessagePassing):
     # ── Main entry point ──────────────────────────────────────────────────────
 
     def propagate(self, edge_index, size=None, **kwargs):
-        chunk_nodes = getattr(self, '_chunk_nodes', None)
+        # Fast path: inference pays zero checkpoint overhead.  Checked first so
+        # eval() does not even flatten kwargs.
+        if not self.training:
+            return super(RematMessagePassing, self).propagate(
+                edge_index, size=size, **kwargs
+            )
 
         # SAR path: chunk by destination-node ranges
-        if (chunk_nodes is not None
-                and self.training
-                and edge_index.size(1) > chunk_nodes):
+        chunk_nodes = getattr(self, '_chunk_nodes', None)
+        if chunk_nodes is not None and edge_index.size(1) > chunk_nodes:
             return self._propagate_chunked(
                 edge_index, size=size, chunk_nodes=chunk_nodes, **kwargs
             )
 
         # Standard propagate-level checkpoint (original behaviour)
         flat, spec = _flatten_kwargs(kwargs)
-
         any_float_grad = any(
             t.is_floating_point() and t.requires_grad for t in flat
         )
-
-        if not (self.training and flat and any_float_grad):
+        if not (flat and any_float_grad):
             return super(RematMessagePassing, self).propagate(
                 edge_index, size=size, **kwargs
             )
@@ -163,43 +178,104 @@ class RematMessagePassing(MessagePassing):
 
         return ckpt.checkpoint(_prop, *flat, use_reentrant=False)
 
-    # ── Per-edge kwargs slicing ───────────────────────────────────────────────
+    # ── Per-edge kwargs handling (sort-based windowing) ───────────────────────
 
     @staticmethod
-    def _slice_edge_kwargs(kwargs: dict, mask: torch.Tensor,
-                           num_edges_total: int) -> dict:
+    def _permute_edge_kwargs(kwargs: dict, perm: torch.Tensor,
+                             num_edges_total: int) -> dict:
         """
-        Slice any per-edge tensors in kwargs to match the current chunk.
-
-        A tensor is considered per-edge when its leading dimension equals
-        num_edges_total.  Node-level tensors and scalars are passed through
-        unchanged.
-
-        This handles the case (PyG ≥ 2.x GATConv, TransformerConv) where
-        attention weights alpha [E, H] are pre-computed by edge_updater()
-        BEFORE propagate() is called, then passed as a propagate() kwarg.
-        Without slicing, chunk_ei has k edges but alpha still has E rows,
-        causing a size mismatch inside message().
+        Reorder per-edge tensors by *perm* once, so later chunks are contiguous
+        slices.  A tensor is per-edge when its leading dim equals
+        num_edges_total (e.g. GAT/Transformer alpha [E, H] pre-computed by
+        edge_updater()).  Node tensors and scalars pass through unchanged.
         """
-        sliced: dict = {}
+        out: dict = {}
         for key, val in kwargs.items():
             if isinstance(val, torch.Tensor):
-                if val.size(0) == num_edges_total:
-                    sliced[key] = val[mask]
-                else:
-                    sliced[key] = val
+                out[key] = val[perm] if val.size(0) == num_edges_total else val
             elif isinstance(val, (tuple, list)):
-                new_items = []
-                for item in val:
-                    if (isinstance(item, torch.Tensor)
-                            and item.size(0) == num_edges_total):
-                        new_items.append(item[mask])
-                    else:
-                        new_items.append(item)
-                sliced[key] = type(val)(new_items)
+                out[key] = type(val)(
+                    item[perm] if (isinstance(item, torch.Tensor)
+                                   and item.size(0) == num_edges_total)
+                    else item
+                    for item in val
+                )
             else:
-                sliced[key] = val
-        return sliced
+                out[key] = val
+        return out
+
+    @staticmethod
+    def _slice_edge_kwargs_range(kwargs: dict, lo: int, hi: int,
+                                 num_edges_total: int) -> dict:
+        """Slice already-permuted per-edge tensors to the contiguous [lo, hi)."""
+        out: dict = {}
+        for key, val in kwargs.items():
+            if isinstance(val, torch.Tensor):
+                out[key] = val[lo:hi] if val.size(0) == num_edges_total else val
+            elif isinstance(val, (tuple, list)):
+                out[key] = type(val)(
+                    item[lo:hi] if (isinstance(item, torch.Tensor)
+                                    and item.size(0) == num_edges_total)
+                    else item
+                    for item in val
+                )
+            else:
+                out[key] = val
+        return out
+
+    @staticmethod
+    def _can_local_remap(kwargs: dict, num_src: int, num_dst: int,
+                         num_edges_total: int) -> bool:
+        """
+        True when destination indices can be safely remapped to a local
+        [0, chunk_len) range — i.e. the only node-indexed kwarg is the
+        recognised `x` (single tensor or src/dst tuple).
+
+        Any *other* node-indexed tensor (leading dim == num_src or num_dst,
+        and not == num_edges_total) is something we cannot classify as
+        source- vs destination-indexed by shape alone (e.g. TransformerConv's
+        per-dst `query` collides in size with per-src `key`/`value` on a
+        homogeneous graph).  In that case we fall back to full-size scatter.
+        """
+        def _is_unhandled_node_tensor(t: object) -> bool:
+            return (isinstance(t, torch.Tensor)
+                    and t.dim() > 0
+                    and t.size(0) != num_edges_total
+                    and t.size(0) in (num_src, num_dst))
+
+        for key, val in kwargs.items():
+            if key == "x":
+                continue  # handled explicitly by _localize_node_kwargs
+            if _is_unhandled_node_tensor(val):
+                return False
+            if isinstance(val, (tuple, list)):
+                if any(_is_unhandled_node_tensor(v) for v in val):
+                    return False
+        return True
+
+    @staticmethod
+    def _localize_node_kwargs(kwargs: dict, dst_start: int, dst_end: int,
+                              num_src: int, num_dst: int) -> dict:
+        """
+        Slice the destination side of the `x` node-feature kwarg to the window
+        so the chunk's scatter output is [chunk_len, F].
+
+        Source features stay full (messages gather by global source index);
+        only the destination features are sliced:
+          * x Tensor  → (x_full_src, x[dst_start:dst_end])
+          * x (xs, xd) → (xs, xd[dst_start:dst_end])
+        """
+        out = dict(kwargs)
+        x = out.get("x", None)
+        if isinstance(x, torch.Tensor):
+            # Single tensor ⇒ homogeneous graph ⇒ src and dst share features.
+            out["x"] = (x, x[dst_start:dst_end])
+        elif isinstance(x, (tuple, list)) and len(x) == 2:
+            x_src, x_dst = x[0], x[1]
+            if isinstance(x_dst, torch.Tensor):
+                x_dst = x_dst[dst_start:dst_end]
+            out["x"] = (x_src, x_dst)
+        return out
 
     # ── SAR-inspired chunked propagation ──────────────────────────────────────
 
@@ -208,21 +284,30 @@ class RematMessagePassing(MessagePassing):
         Destination-node chunked propagation (SAR-inspired).
 
         Each window [dst_start, dst_end) holds ALL edges pointing to those
-        destination nodes, ensuring every aggregation type is computed over
-        the complete neighbourhood:
+        destination nodes, ensuring every aggregation type is computed over the
+        complete neighbourhood:
 
-          add / sum  : partial sums are additive           ✓
-          mean       : full neighbourhood per chunk         ✓
-          max        : full neighbourhood per chunk         ✓
-          attention  : softmax denominator spans full neigh ✓
+          add / sum  : partial sums are additive            ✓
+          mean       : full neighbourhood per chunk          ✓
+          max        : full neighbourhood per chunk          ✓
+          attention  : softmax denominator spans full neigh  ✓
 
-        Per-edge kwargs (e.g. pre-computed alpha) are sliced to each chunk
-        before the checkpoint call to prevent size mismatches.
+        Implementation (two optimisations over the naive version):
 
-        Memory per chunk:
+          1. Sort edges by destination ONCE (O(E log E)).  Each window is then
+             a contiguous slice located with searchsorted, instead of a fresh
+             boolean mask over all E edges per window (O(num_chunks × E)).
+
+          2. Local destination remap (when _can_local_remap): destination
+             indices are shifted to [0, chunk_len) and dst features sliced to
+             the window, so each chunk's scatter output is [chunk_len, F].
+             Otherwise (e.g. TransformerConv) fall back to a full [num_dst, F]
+             scatter that is sliced afterwards — correct, just less memory-thrifty.
+
+        Memory per chunk (local-remap path):
           edge tensors  : O(chunk_edges × F)  — freed by checkpoint after backward
-          scatter output: O(num_nodes × F)    — one temporary, freed after clone
-          node features : O(num_nodes × F_in) — shared input, not duplicated
+          scatter output: O(chunk_len  × F)   — no full [num_dst, F] buffer
+          node features : O(num_src × F_in)    — shared source input, not duplicated
         """
         # Resolve graph dimensions
         num_dst = (
@@ -234,52 +319,76 @@ class RematMessagePassing(MessagePassing):
             else int(edge_index[0].max()) + 1
         )
         num_edges_total = edge_index.size(1)
-        full_size = (num_src, num_dst)
+
+        # ── (1) sort edges by destination once; windows become contiguous ──────
+        perm       = torch.argsort(edge_index[1])
+        sorted_ei  = edge_index[:, perm]
+        sorted_dst = sorted_ei[1]
+        perm_kwargs = self._permute_edge_kwargs(kwargs, perm, num_edges_total)
+
+        # Edge boundaries for every window, computed in one searchsorted + sync.
+        node_bounds = list(range(0, num_dst, chunk_nodes)) + [num_dst]
+        edge_bounds = torch.searchsorted(
+            sorted_dst,
+            torch.tensor(node_bounds, device=sorted_dst.device,
+                         dtype=sorted_dst.dtype),
+        ).tolist()
+
+        # ── (2) decide path once ───────────────────────────────────────────────
+        local = self._can_local_remap(kwargs, num_src, num_dst, num_edges_total)
 
         pieces: list[tuple[int, Optional[torch.Tensor]]] = []
         out_dtype = out_device = out_tail = None
 
-        for dst_start in range(0, num_dst, chunk_nodes):
-            dst_end   = min(dst_start + chunk_nodes, num_dst)
-            chunk_len = dst_end - dst_start
+        for w in range(len(node_bounds) - 1):
+            dst_start, dst_end = node_bounds[w], node_bounds[w + 1]
+            lo, hi             = edge_bounds[w], edge_bounds[w + 1]
+            chunk_len          = dst_end - dst_start
 
-            # All edges whose destination falls in [dst_start, dst_end)
-            mask     = (edge_index[1] >= dst_start) & (edge_index[1] < dst_end)
-            chunk_ei = edge_index[:, mask]
-
-            if chunk_ei.size(1) == 0:
+            if hi == lo:                       # isolated dst nodes — no edges
                 pieces.append((chunk_len, None))
                 continue
 
-            # Slice per-edge kwargs to this chunk (fixes PyG >= 2.x GAT alpha mismatch)
-            chunk_kwargs = self._slice_edge_kwargs(kwargs, mask, num_edges_total)
+            chunk_ei     = sorted_ei[:, lo:hi]
+            chunk_kwargs = self._slice_edge_kwargs_range(
+                perm_kwargs, lo, hi, num_edges_total
+            )
 
-            # Flatten chunk-specific kwargs for the checkpoint call
+            if local:
+                # Shift dst indices into [0, chunk_len) and slice dst features.
+                chunk_ei = torch.stack(
+                    [chunk_ei[0], chunk_ei[1] - dst_start], dim=0
+                )
+                chunk_kwargs = self._localize_node_kwargs(
+                    chunk_kwargs, dst_start, dst_end, num_src, num_dst
+                )
+                run_size = (num_src, chunk_len)
+            else:
+                run_size = (num_src, num_dst)
+
             flat_chunk, spec_chunk = _flatten_kwargs(chunk_kwargs)
             any_float_grad = any(
                 t.is_floating_point() and t.requires_grad for t in flat_chunk
             )
 
-            if self.training and flat_chunk and any_float_grad:
-                # _run_chunk captures chunk_ei + spec_chunk by parameter binding
-                chunk_full = self._run_chunk(
-                    chunk_ei, full_size, flat_chunk, spec_chunk
-                )
+            if flat_chunk and any_float_grad:
+                out = self._run_chunk(chunk_ei, run_size, flat_chunk, spec_chunk)
             else:
-                chunk_full = super(RematMessagePassing, self).propagate(
-                    chunk_ei, size=full_size, **chunk_kwargs
+                out = super(RematMessagePassing, self).propagate(
+                    chunk_ei, size=run_size, **chunk_kwargs
                 )
 
-            # Extract the relevant slice and clone to free the [num_dst, F] buffer
-            chunk_slice = chunk_full[dst_start:dst_end].clone()
-            del chunk_full
+            if local:
+                piece = out                    # already [chunk_len, F]
+            else:
+                piece = out[dst_start:dst_end].clone()   # free [num_dst, F]
+                del out
 
             if out_dtype is None:
-                out_dtype  = chunk_slice.dtype
-                out_device = chunk_slice.device
-                out_tail   = chunk_slice.shape[1:]
-
-            pieces.append((chunk_len, chunk_slice))
+                out_dtype, out_device, out_tail = (
+                    piece.dtype, piece.device, piece.shape[1:]
+                )
+            pieces.append((chunk_len, piece))
 
         # Fill empty chunks (isolated nodes) with zeros, then cat
         resolved: list[torch.Tensor] = []
@@ -291,18 +400,17 @@ class RematMessagePassing(MessagePassing):
                         "the graph has no edges."
                     )
                 tensor = torch.zeros(
-                    chunk_len, *out_tail,
-                    dtype=out_dtype, device=out_device,
+                    chunk_len, *out_tail, dtype=out_dtype, device=out_device,
                 )
             resolved.append(tensor)
 
-        # CatBackward correctly fans the upstream gradient to each chunk's checkpoint
+        # CatBackward fans the upstream gradient to each chunk's checkpoint.
         return torch.cat(resolved, dim=0)
 
     def _run_chunk(
         self,
         chunk_ei: torch.Tensor,
-        full_size: tuple[int, int],
+        run_size: tuple[int, int],
         flat_chunk: list[torch.Tensor],
         spec_chunk: dict,
     ) -> torch.Tensor:
@@ -317,7 +425,7 @@ class RematMessagePassing(MessagePassing):
         def _prop(*tensors):
             kw = _unflatten_kwargs(list(tensors), spec_chunk)
             return super(RematMessagePassing, self).propagate(
-                chunk_ei, size=full_size, **kw
+                chunk_ei, size=run_size, **kw
             )
 
         return ckpt.checkpoint(_prop, *flat_chunk, use_reentrant=False)
