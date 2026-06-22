@@ -57,7 +57,7 @@ from .core.dsl import _apply_to_model, AGGR, MODULE
 from .core.wrapper import _RematConv
 from .core.remat_mp import RematMessagePassing
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__     = [
     "gnn_remat",
     "remove_remat",

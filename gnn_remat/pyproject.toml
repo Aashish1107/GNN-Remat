@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gnn-remat"
-version = "0.3.0"
+version = "0.3.1"
 description = "Aggregation-granular rematerialization for PyTorch Geometric, with SAR-inspired destination-node chunked propagation for large-graph memory efficiency."
 requires-python = ">=3.9"
 dependencies = ["torch>=2.0", "torch_geometric>=2.3"]
@@ -21,6 +21,18 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 
 # ── Changelog ──────────────────────────────────────────────────────────────────
+# v0.3.1 — chunked-path performance + correctness
+#   • Sort-based windowing: edges sorted by destination once (O(E log E)); each
+#       window located via searchsorted instead of an O(num_chunks × E) mask.
+#   • Local destination remap (GCN/SAGE/GAT): each chunk's scatter output is
+#       [chunk_len, F] instead of full [num_dst, F], removing the O(num_dst × F)
+#       memory floor. Measured GAT 40K/1M: monotone 4242 MB → 330 MB (~13×), no
+#       longer regresses for small chunks. TransformerConv safely falls back.
+#   • auto_chunk_size(): per-edge width = num_heads × out_channels + num_heads
+#       (was out_channels + num_heads; under-counted concat attention by ~heads×).
+#   • Zero-overhead inference: propagate() checks self.training before flattening.
+#   • +5 tests (TransformerConv chunk parity, local-remap path selection); 82 pass.
+#
 # v0.3.0 — SAR-inspired improvements
 #   • Destination-node chunked propagation (_propagate_chunked):
 #       processes edges in contiguous dst-node windows so only one chunk's

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="gnn-remat",
-    version="0.3.0",
+    version="0.3.1",
     description=(
         "Aggregation-granular rematerialization for PyTorch Geometric, "
         "with SAR-inspired destination-node chunked propagation for "

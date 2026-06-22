@@ -113,7 +113,7 @@ gnn_remat/
 │   ├── models.py     ← GCN, GraphSAGE, GAT, GraphTransformer reference models.
 │   └── runner.py     ← CLI: --model gat --nodes 5000 --all --chunk-nodes auto
 │
-├── tests/            ← 77 tests across 6 files
+├── tests/            ← 82 tests across 6 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py           ← Full feature tour of all four DSL styles
@@ -422,7 +422,7 @@ model = remat.checkpoint.apply(my_model, rules=[
 python run_tests.py
 ```
 
-Runs all 77 tests.
+Runs all 82 tests.
 
 ## Benchmarks
 
@@ -454,7 +454,7 @@ gnn_remat/
 │   ├── profiler.py    # measures peak GPU memory + throughput
 │   ├── models.py      # GCN, GraphSAGE, GAT, GraphTransformer reference models
 │   └── runner.py      # CLI entry point (--chunk-nodes N|auto)
-├── tests/             # 77 tests across 6 files
+├── tests/             # 82 tests across 6 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py            # full feature tour of all four DSL styles
@@ -472,13 +472,26 @@ Items known to be missing or worth improving, roughly in priority order.
 - **`mode="auto"` selectivity on CPU** — the proxy now estimates *net* savings
   (`freed − added`) per SAR Case 1/2, so GCN/SAGE score negative and are skipped
   while dense attention layers are selected. See `core/heuristic.py`.
+- **Sort-based chunking** — `_propagate_chunked` now sorts edges by destination
+  once (`O(E log E)`) and locates each window with `searchsorted`, instead of a
+  boolean mask over all E edges per window (`O(num_chunks × E)`).
+- **Chunked output-memory floor removed** — for `x`-based convs (GCN, SAGE, GAT)
+  destinations are remapped to a local range so each chunk's scatter output is
+  `[chunk_len, F]`, not the full `[num_dst, F]`. Measured (GAT, 40K nodes / 1M
+  edges): peak no longer bottoms out and reverses below `chunk≈num_dst/degree`;
+  it now decreases monotonically (4242 MB → 330 MB at chunk=300, ~13×).
+  TransformerConv (per-dst `query`) safely falls back to full-size scatter.
+- **`auto_chunk_size` multi-head sizing** — per-edge width is now
+  `num_heads × out_channels + num_heads` (was `out_channels + num_heads`), which
+  under-counted concat attention by ~`heads×`.
+- **Zero-overhead inference** — `propagate()` checks `self.training` before any
+  kwarg flattening, so eval truly pays nothing.
 
 **Correctness gaps**
 
 - **Bipartite graph test** — `propagate()` accepts `x=(x_src, x_dst)` tuple inputs
-  for bipartite graphs.  `_flatten_kwargs` / `_slice_edge_kwargs` handle the tuple
-  case but no test exercises this path end-to-end; the shape-based per-edge
-  detection in `_slice_edge_kwargs` is most likely to misfire here.
+  for bipartite graphs.  The chunk path handles the tuple case but no test
+  exercises a true bipartite (num_src ≠ num_dst) graph end-to-end.
 
 - **Chunked propagation under attention dropout** — chunked correctness tests use
   `eval()` / dropout-free convs.  In `train()` each chunk is a separate checkpoint
@@ -491,6 +504,10 @@ Items known to be missing or worth improving, roughly in priority order.
 
 **Missing features**
 
+- **Mixed precision (AMP / bf16)** — no autocast support or test; ~2× memory on
+  every tensor and faster matmuls, stacking with remat/chunking. Biggest absolute
+  lever still on the table.
+
 - **Memory budget API** — `gnn_remat(model, memory_budget_mb=6000)` would select
   layers greedily until the budget is met.  Currently users must reason about
   `heuristic_threshold` in raw bytes, which is less intuitive.
@@ -500,9 +517,9 @@ Items known to be missing or worth improving, roughly in priority order.
   GCN/SAGE want `"module"` or `chunk_nodes`. Choosing granularity *per layer* would
   remove the need for manual `when_type()` rules in mixed models.
 
-- **Sort-based chunking** — `_propagate_chunked` re-masks all edges per window
-  (`O(num_chunks × E)`). Sorting edges by destination once would make each chunk a
-  contiguous slice (`O(E log E)` once), removing the main chunked-path overhead.
+- **Local remap for non-`x` convs** — TransformerConv falls back to full-size
+  scatter (keeps the `O(num_dst × F)` output term). Classifying its per-dst
+  `query` via PyG's message-arg inspection would extend the floor fix to it.
 
 - **`detect()` output enrichment** — `LayerInfo` exposes `name, module, parent,
   attr`. Adding `has_attention: bool` and `param_count: int` would make the
