@@ -48,44 +48,47 @@ class ProfileResult:
 
 @dataclass
 class CompareResult:
-    """Side-by-side comparison of three conditions."""
+    """Side-by-side comparison of three (or four) conditions."""
     baseline: ProfileResult
     module_ckpt: ProfileResult
     gnn_remat: ProfileResult
+    chunked_remat: Optional[ProfileResult] = None  # set when chunk_nodes is passed
 
     def summary(self) -> str:
         rows = [self.baseline, self.module_ckpt, self.gnn_remat]
- 
+        if self.chunked_remat is not None:
+            rows.append(self.chunked_remat)
+
         # Use the first successful row as the reference for "Mem saved".
         # Normally that's the baseline; when baseline OOMs we fall back to
         # module-checkpoint so the GNN-Remat saving is still legible.
         reference = next((r for r in rows if r.ok), None)
         ref_is_baseline = reference is self.baseline
         saved_header = "Mem saved" if (reference is None or ref_is_baseline) else "Mem saved*"
- 
+
         lines = [
-            f"{'Condition':<22}  {'Peak Mem (MB)':>14}  "
+            f"{'Condition':<24}  {'Peak Mem (MB)':>14}  "
             f"{'Epoch (ms)':>11}  {saved_header:>10}",
-            "-" * 64,
+            "-" * 66,
         ]
         for r in rows:
             if not r.ok:
                 lines.append(
-                    f"{r.label:<22}  {'OOM':>14}  {'OOM':>11}  {'—':>10}"
+                    f"{r.label:<24}  {'OOM':>14}  {'OOM':>11}  {'—':>10}"
                 )
                 continue
             if reference is None or reference.peak_memory_mb <= 0:
                 lines.append(
-                    f"{r.label:<22}  {r.peak_memory_mb:>14.1f}  "
+                    f"{r.label:<24}  {r.peak_memory_mb:>14.1f}  "
                     f"{r.epoch_time_ms:>11.1f}  {'—':>10}"
                 )
             else:
                 saved = (1 - r.peak_memory_mb / reference.peak_memory_mb) * 100
                 lines.append(
-                    f"{r.label:<22}  {r.peak_memory_mb:>14.1f}  "
+                    f"{r.label:<24}  {r.peak_memory_mb:>14.1f}  "
                     f"{r.epoch_time_ms:>11.1f}  {saved:>9.1f}%"
                 )
- 
+
         if reference is not None and not ref_is_baseline:
             lines.append(
                 f"  * Mem saved is vs. {reference.label} "
@@ -251,15 +254,18 @@ def compare(
     edge_index: torch.Tensor,
     num_epochs: int = 5,
     device: Optional[torch.device] = None,
+    chunk_nodes: Optional[int] = None,
 ) -> CompareResult:
     """
-    Profile *model* under three conditions and return a CompareResult.
+    Profile *model* under three (or four) conditions and return a CompareResult.
 
     Conditions
     ----------
-    1. Baseline   — vanilla model, no checkpointing
-    2. ModuleCkpt — torch.utils.checkpoint wrapping entire layers
-    3. GNN-Remat  — aggregation-granular checkpointing (this project)
+    1. Baseline        — vanilla model, no checkpointing
+    2. ModuleCkpt      — torch.utils.checkpoint wrapping entire layers
+    3. GNN-Remat       — propagate-level checkpoint (this project)
+    4. GNN-Remat+Chunk — condition 3 + SAR-inspired chunked propagation
+                         (only when chunk_nodes is not None)
 
     Parameters
     ----------
@@ -267,6 +273,10 @@ def compare(
     x, edge_index : torch.Tensor
     num_epochs : int
     device : torch.device, optional
+    chunk_nodes : int, optional
+        If set, adds a 4th condition using destination-node chunked propagation.
+        Use auto_chunk_size() from gnn_remat to compute a good value, or pass
+        an explicit integer.
 
     Returns
     -------
@@ -316,7 +326,7 @@ def compare(
     del module_model
     _between_conditions()
 
-    # ── Condition 3: GNN-Remat ───────────────────────────────────────────────
+    # ── Condition 3: GNN-Remat (propagate-level checkpoint only) ─────────────
     remat_model = gnn_remat(copy.deepcopy(model))
     remat_result = profile(
         remat_model, x, edge_index,
@@ -327,8 +337,22 @@ def compare(
     del remat_model
     _between_conditions()
 
+    # ── Condition 4: GNN-Remat + chunked propagation (optional) ──────────────
+    chunked_result: Optional[ProfileResult] = None
+    if chunk_nodes is not None:
+        chunked_model = gnn_remat(copy.deepcopy(model), chunk_nodes=chunk_nodes)
+        chunked_result = profile(
+            chunked_model, x, edge_index,
+            label=f"GNN-Remat+Chunk",
+            num_epochs=num_epochs,
+            device=device,
+        )
+        del chunked_model
+        _between_conditions()
+
     return CompareResult(
         baseline=base_result,
         module_ckpt=mod_result,
         gnn_remat=remat_result,
+        chunked_remat=chunked_result,
     )

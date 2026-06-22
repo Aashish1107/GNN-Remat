@@ -9,9 +9,13 @@ Usage
     python -m gnn_remat.benchmark.runner --model gat --nodes 5000
     python -m gnn_remat.benchmark.runner --all --nodes 5000
 
+    # With SAR-inspired chunked propagation (adds a 4th benchmark condition)
+    python -m gnn_remat.benchmark.runner --model gat --nodes 50000 --chunk-nodes 5000
+    python -m gnn_remat.benchmark.runner --model gat --nodes 50000 --chunk-nodes auto
+
     # Scale sweep: 5K → 10K → 25K → 50K → 100K nodes in one table
     python -m gnn_remat.benchmark.runner --model gat --scale
-    python -m gnn_remat.benchmark.runner --all --scale
+    python -m gnn_remat.benchmark.runner --model gat --scale --chunk-nodes auto
 
     # OOM crossover: double nodes until baseline OOMs but GNN-Remat fits (CUDA only)
     python -m gnn_remat.benchmark.runner --model gat --find-limit
@@ -54,6 +58,43 @@ def _build_kwargs(model_name: str, args) -> dict:
     return kw
 
 
+def _chunk_nodes_type(value: str):
+    """Custom argparse type: accepts an integer or the string 'auto'."""
+    if value.lower() == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--chunk-nodes must be a positive integer or 'auto', got: {value!r}"
+        )
+
+
+def _resolve_chunk_nodes(args, num_nodes: int):
+    """
+    Resolve --chunk-nodes to an actual integer (or None).
+
+    'auto' → calls auto_chunk_size() with the model dimensions from args.
+    int    → returned unchanged.
+    None   → no chunking.
+    """
+    raw = getattr(args, "chunk_nodes", None)
+    if raw is None:
+        return None
+    if raw == "auto":
+        from gnn_remat import auto_chunk_size
+        chunk = auto_chunk_size(
+            num_nodes=num_nodes,
+            out_channels=args.hidden,
+            num_heads=args.heads,
+            avg_degree=float(args.degree),
+        )
+        print(f"  [auto chunk_nodes] = {chunk:,}  "
+              f"(hidden={args.hidden}, heads={args.heads}, degree={args.degree})")
+        return chunk
+    return raw  # already an int
+
+
 def _cleanup():
     gc.collect()
     if torch.cuda.is_available():
@@ -77,9 +118,13 @@ def _is_cuda_context_error(exc: BaseException) -> bool:
 # ── Single run ────────────────────────────────────────────────────────────────
 
 def run_one(model_name: str, args, device):
+    chunk_nodes = _resolve_chunk_nodes(args, args.nodes)
+
     print(f"\n{'='*64}")
     print(f"  Model: {model_name.upper()}  |  nodes={args.nodes:,}  "
           f"features={args.features}  layers={args.layers}")
+    if chunk_nodes is not None:
+        print(f"  Chunked propagation: chunk_nodes={chunk_nodes:,}")
     print(f"{'='*64}")
 
     model = build(model_name, **_build_kwargs(model_name, args))
@@ -94,7 +139,8 @@ def run_one(model_name: str, args, device):
         print(f"  [skip] could not allocate graph tensors: {e}")
         return None
 
-    result = compare(model, x, edge_index, num_epochs=args.epochs, device=device)
+    result = compare(model, x, edge_index, num_epochs=args.epochs,
+                     device=device, chunk_nodes=chunk_nodes)
     print(result.summary())
     return result
 
@@ -106,32 +152,47 @@ def run_scale_sweep(model_name: str, args, device):
     Profile the model at each node count in _SCALE_NODES and print a single
     table showing how memory savings grow with graph size.
     """
+    using_chunk = getattr(args, "chunk_nodes", None) is not None
+
     if device.type == "cpu":
         print("  Note: running scale sweep on CPU — memory readings will all be 0.0 MB "
               "(CPU allocator has no peak counter). Use CUDA for meaningful results.")
 
-    print(f"\n{'='*80}")
+    width = 97 if using_chunk else 80
+    print(f"\n{'='*width}")
     print(f"  Scale sweep — {model_name.upper()}  "
           f"features={args.features}  hidden={args.hidden}  "
           f"layers={args.layers}  degree={args.degree}  heads={args.heads}")
-    print(f"{'='*80}")
+    if using_chunk:
+        raw = args.chunk_nodes
+        chunk_label = "auto" if raw == "auto" else f"{raw:,}"
+        print(f"  Chunked propagation: chunk_nodes={chunk_label}")
+    print(f"{'='*width}")
 
-    col = f"{'Nodes':>8}  {'Edges':>9}  {'Baseline':>11}  " \
-          f"{'Module ckpt':>12}  {'GNN-Remat':>11}  {'Remat saving':>13}"
+    if using_chunk:
+        col = (f"{'Nodes':>8}  {'Edges':>9}  {'Baseline':>11}  "
+               f"{'Module ckpt':>12}  {'GNN-Remat':>11}  "
+               f"{'Chunked':>11}  {'Chunk saving':>13}")
+    else:
+        col = (f"{'Nodes':>8}  {'Edges':>9}  {'Baseline':>11}  "
+               f"{'Module ckpt':>12}  {'GNN-Remat':>11}  {'Remat saving':>13}")
     print(col)
-    print("─" * 80)
+    print("─" * width)
 
     for n_nodes in _SCALE_NODES:
+        chunk_nodes = _resolve_chunk_nodes(args, n_nodes)
         model   = build(model_name, **_build_kwargs(model_name, args))
         x, ei   = _make_graph(n_nodes, args.degree, args.features, torch.device("cpu"))
         n_edges = n_nodes * args.degree
 
         try:
-            result = compare(model, x, ei, num_epochs=args.epochs, device=device)
+            result = compare(model, x, ei, num_epochs=args.epochs,
+                             device=device, chunk_nodes=chunk_nodes)
         except Exception as exc:
             del model, x, ei
             if _is_cuda_context_error(exc):
-                print(f"{n_nodes:>8,}  {n_edges:>9,}  (CUDA context corrupted after OOM — stopping sweep)")
+                print(f"{n_nodes:>8,}  {n_edges:>9,}  "
+                      f"(CUDA context corrupted after OOM — stopping sweep)")
             else:
                 traceback.print_exc()
                 print(f"{n_nodes:>8,}  — unexpected error, see above")
@@ -143,16 +204,34 @@ def run_scale_sweep(model_name: str, args, device):
             return f"{r.peak_memory_mb:>7.0f} MB" if r.ok else "        OOM"
 
         ref = result.baseline
+
+        # GNN-Remat saving vs baseline
         if ref.ok and result.gnn_remat.ok:
-            pct = (1 - result.gnn_remat.peak_memory_mb / ref.peak_memory_mb) * 100
+            pct    = (1 - result.gnn_remat.peak_memory_mb / ref.peak_memory_mb) * 100
             saving = f"{pct:>+.1f}%"
         elif not ref.ok and result.gnn_remat.ok:
             saving = "baseline OOM"
         else:
             saving = "—"
 
-        print(f"{n_nodes:>8,}  {n_edges:>9,}  {_mem(result.baseline)}  "
-              f"{_mem(result.module_ckpt)}   {_mem(result.gnn_remat)}  {saving:>13}")
+        if using_chunk and result.chunked_remat is not None:
+            # Chunk saving vs baseline (or gnn_remat when baseline OOM'd)
+            chunk_ref = ref if ref.ok else result.gnn_remat
+            if chunk_ref.ok and result.chunked_remat.ok:
+                pct_c       = (1 - result.chunked_remat.peak_memory_mb
+                               / chunk_ref.peak_memory_mb) * 100
+                chunk_saving = f"{pct_c:>+.1f}%"
+            elif not ref.ok and result.chunked_remat.ok:
+                chunk_saving = "base OOM"
+            else:
+                chunk_saving = "—"
+
+            print(f"{n_nodes:>8,}  {n_edges:>9,}  {_mem(result.baseline)}  "
+                  f"{_mem(result.module_ckpt)}   {_mem(result.gnn_remat)}  "
+                  f"{_mem(result.chunked_remat)}  {chunk_saving:>13}")
+        else:
+            print(f"{n_nodes:>8,}  {n_edges:>9,}  {_mem(result.baseline)}  "
+                  f"{_mem(result.module_ckpt)}   {_mem(result.gnn_remat)}  {saving:>13}")
 
     print()
 
@@ -164,32 +243,48 @@ def find_oom_limit(model_name: str, args, device):
     Double node count until baseline OOMs but GNN-Remat still fits.
     This is the headline "OOM-to-fits" result: GNN-Remat enables training at
     graph sizes that are unreachable with the unmodified model.
+
+    When --chunk-nodes is also supplied, a 4th column shows whether the chunked
+    variant fits at even larger graphs.
     """
     if device.type == "cpu":
         print("  [skip] --find-limit requires CUDA. "
               "CPU peak memory is not constrained the same way.")
         return
 
+    using_chunk = getattr(args, "chunk_nodes", None) is not None
+    width = 70 if using_chunk else 56
+
     print(f"\n{'='*64}")
     print(f"  OOM crossover search — {model_name.upper()}")
     print(f"  Config: features={args.features}  hidden={args.hidden}  "
           f"layers={args.layers}  heads={args.heads}  degree={args.degree}")
+    if using_chunk:
+        raw = args.chunk_nodes
+        print(f"  Chunked propagation: chunk_nodes={'auto' if raw == 'auto' else f'{raw:,}'}")
     print(f"  Starting at {args.nodes:,} nodes, doubling each step "
           f"(cap: {args.max_nodes:,})")
     print(f"{'='*64}")
-    print(f"  {'Nodes':>9}  {'Edges':>10}  {'Baseline':>12}  {'GNN-Remat':>12}")
-    print(f"  {'─'*52}")
+    if using_chunk:
+        print(f"  {'Nodes':>9}  {'Edges':>10}  {'Baseline':>12}  "
+              f"{'GNN-Remat':>12}  {'Chunked':>10}")
+        print(f"  {'─'*width}")
+    else:
+        print(f"  {'Nodes':>9}  {'Edges':>10}  {'Baseline':>12}  {'GNN-Remat':>12}")
+        print(f"  {'─'*width}")
 
     n_nodes = args.nodes
     found   = False
 
     while n_nodes <= args.max_nodes:
+        chunk_nodes = _resolve_chunk_nodes(args, n_nodes)
         model   = build(model_name, **_build_kwargs(model_name, args))
         x, ei   = _make_graph(n_nodes, args.degree, args.features, torch.device("cpu"))
         n_edges = n_nodes * args.degree
 
         try:
-            result = compare(model, x, ei, num_epochs=2, device=device)
+            result = compare(model, x, ei, num_epochs=2, device=device,
+                             chunk_nodes=chunk_nodes)
         except Exception as exc:
             del model, x, ei
             if _is_cuda_context_error(exc):
@@ -200,23 +295,36 @@ def find_oom_limit(model_name: str, args, device):
         finally:
             _cleanup()
 
-        base_ok  = result.baseline.ok
-        remat_ok = result.gnn_remat.ok
+        base_ok    = result.baseline.ok
+        remat_ok   = result.gnn_remat.ok
+        chunked_ok = result.chunked_remat is not None and result.chunked_remat.ok
 
-        base_str  = f"{result.baseline.peak_memory_mb:>8.0f} MB"  if base_ok  else "         OOM"
-        remat_str = f"{result.gnn_remat.peak_memory_mb:>8.0f} MB" if remat_ok else "         OOM"
-        print(f"  {n_nodes:>9,}  {n_edges:>10,}  {base_str}  {remat_str}")
+        base_str  = (f"{result.baseline.peak_memory_mb:>8.0f} MB"
+                     if base_ok else "         OOM")
+        remat_str = (f"{result.gnn_remat.peak_memory_mb:>8.0f} MB"
+                     if remat_ok else "         OOM")
 
-        if not base_ok and remat_ok:
-            print(f"\n  GNN-Remat enables training at {n_nodes:,} nodes ({n_edges:,} edges).")
+        if using_chunk and result.chunked_remat is not None:
+            chunk_str = (f"{result.chunked_remat.peak_memory_mb:>6.0f} MB"
+                         if chunked_ok else "       OOM")
+            print(f"  {n_nodes:>9,}  {n_edges:>10,}  {base_str}  {remat_str}  {chunk_str}")
+        else:
+            print(f"  {n_nodes:>9,}  {n_edges:>10,}  {base_str}  {remat_str}")
+
+        # Crossover: baseline OOM but at least one remat variant fits
+        fits_variant = remat_ok or chunked_ok
+        if not base_ok and fits_variant:
+            best = result.chunked_remat if chunked_ok else result.gnn_remat
+            label = "GNN-Remat+Chunk" if chunked_ok else "GNN-Remat"
+            print(f"\n  {label} enables training at {n_nodes:,} nodes ({n_edges:,} edges).")
             print(f"    Baseline  : OOM")
-            print(f"    GNN-Remat : {result.gnn_remat.peak_memory_mb:.0f} MB  "
-                  f"({result.gnn_remat.epoch_time_ms:.1f} ms/step)")
+            print(f"    {label:<15}: {best.peak_memory_mb:.0f} MB  "
+                  f"({best.epoch_time_ms:.1f} ms/step)")
             found = True
             break
 
-        if not base_ok and not remat_ok:
-            print(f"\n  Both OOM at {n_nodes:,} nodes.")
+        if not base_ok and not fits_variant:
+            print(f"\n  All conditions OOM at {n_nodes:,} nodes.")
             print("  Try smaller --hidden or --heads, or a GPU with more VRAM.")
             break
 
@@ -260,6 +368,11 @@ def main(argv=None):
                         help="Double nodes until baseline OOMs but GNN-Remat fits (CUDA only)")
     parser.add_argument("--max-nodes",  type=int, default=500_000,
                         help="Node count cap for --find-limit")
+    parser.add_argument("--chunk-nodes", type=_chunk_nodes_type, default=None,
+                        metavar="N|auto",
+                        help="Enable SAR-inspired chunked propagation. Pass an integer "
+                             "(e.g. 5000) or 'auto' to compute from GPU memory. "
+                             "Adds a 4th benchmark condition 'GNN-Remat+Chunk'.")
     args = parser.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -281,13 +394,16 @@ def main(argv=None):
                 if result is None:
                     overview.append((name, "skipped (graph alloc failed)"))
                 else:
-                    rows     = [result.baseline, result.module_ckpt, result.gnn_remat]
+                    rows = [result.baseline, result.module_ckpt, result.gnn_remat]
+                    if result.chunked_remat is not None:
+                        rows.append(result.chunked_remat)
+                    total    = len(rows)
                     ok       = sum(1 for r in rows if r.ok)
                     oom_labs = [r.label for r in rows if not r.ok]
                     if oom_labs:
-                        overview.append((name, f"{ok}/3 ok · OOM: {', '.join(oom_labs)}"))
+                        overview.append((name, f"{ok}/{total} ok · OOM: {', '.join(oom_labs)}"))
                     else:
-                        overview.append((name, "3/3 ok"))
+                        overview.append((name, f"{total}/{total} ok"))
         except Exception as e:
             traceback.print_exc()
             overview.append((name, f"error: {type(e).__name__}"))
