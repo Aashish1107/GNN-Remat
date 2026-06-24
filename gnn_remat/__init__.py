@@ -44,7 +44,7 @@ Composable rules:
 from __future__ import annotations
 
 import copy, logging
-from typing import List, Optional, Sequence, Type
+from typing import List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -52,6 +52,7 @@ from torch_geometric.nn import MessagePassing
 
 from .core.detector import LayerInfo, detect as _detect
 from .core.detector import filter_by_name, filter_by_type
+from .core.detector import CheckpointPlan, LayerPlan, plan_of
 from .core.heuristic import select as _heuristic_select, auto_chunk_size
 from .core.dsl import _apply_to_model, AGGR, MODULE
 from .core.wrapper import _RematConv
@@ -63,6 +64,9 @@ __all__     = [
     "remove_remat",
     "detect",
     "auto_chunk_size",
+    "plan_of",
+    "CheckpointPlan",
+    "LayerPlan",
     "LayerInfo",
 ]
 
@@ -81,8 +85,9 @@ def gnn_remat(
     heuristic_threshold: float = 1.0,
     heuristic_top_k: Optional[int] = None,
     chunk_nodes: Optional[int] = None,
+    return_plan: bool = False,
     verbose: bool = False,
-) -> nn.Module:
+) -> Union[nn.Module, Tuple[nn.Module, CheckpointPlan]]:
     """
     Apply aggregation-granular rematerialization to *model*.
 
@@ -161,6 +166,11 @@ def gnn_remat(
         Default None disables chunking (standard checkpoint only).
         Ignored when granularity="module".
 
+    return_plan : bool
+        If True, return (model, CheckpointPlan).  The plan is the explicit,
+        printable per-layer decision (checkpoint?, granularity, chunk_nodes),
+        derived from the applied model.  print(plan) for the table.
+
     verbose : bool
         If True, log each layer that gets wrapped.
 
@@ -196,7 +206,7 @@ def gnn_remat(
             "gnn_remat: no MessagePassing layers found in model — "
             "returning model unchanged."
         )
-        return model
+        return (model, plan_of(model)) if return_plan else model
 
     # ── Select target layers based on mode ────────────────────────────────────
     if mode == "all":
@@ -235,7 +245,8 @@ def gnn_remat(
         )
 
     gran = AGGR if granularity == "aggr" else MODULE
-    return _apply_to_model(model, gran, layers=targets, chunk_nodes=chunk_nodes)
+    result = _apply_to_model(model, gran, layers=targets, chunk_nodes=chunk_nodes)
+    return (result, plan_of(result)) if return_plan else result
 
 
 # ── Convenience wrappers ──────────────────────────────────────────────────────
