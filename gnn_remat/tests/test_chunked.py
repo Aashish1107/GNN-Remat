@@ -481,3 +481,59 @@ def test_transformer_runtime_uses_fallback_and_is_correct():
     assert torch.allclose(x1.grad, x2.grad, atol=1e-4), (
         f"Transformer fallback grad diff = {(x1.grad - x2.grad).abs().max():.2e}"
     )
+
+
+# ── 12. Adaptability: flow="target_to_source" and SparseTensor input ─────────
+
+class _RevConv(MessagePassing):
+    """Minimal sum-aggregation conv that aggregates at edge_index[0]
+    (flow='target_to_source') — exercises the flow-generic chunk path."""
+    def __init__(self, in_c, out_c):
+        super().__init__(aggr="add", flow="target_to_source")
+        self.lin = nn.Linear(in_c, out_c, bias=False)
+    def forward(self, x, ei):
+        return self.propagate(ei, x=self.lin(x))
+    def message(self, x_j):
+        return x_j
+
+
+def test_chunked_target_to_source_matches_baseline():
+    """Chunking must group by the correct central row for flow='target_to_source'."""
+    x, ei = _random_graph(num_nodes=50, num_edges=180)
+
+    class M(nn.Module):
+        def __init__(self): super().__init__(); self.c = _RevConv(16, 8)
+        def forward(self, x, ei): return self.c(x, ei)
+
+    base = M()
+    x1 = x.clone().detach().requires_grad_(True); base.train()
+    base(x1, ei).sum().backward()
+
+    chunked = gnn_remat(copy.deepcopy(base), chunk_nodes=7)
+    x2 = x.clone().detach().requires_grad_(True); chunked.train()
+    chunked(x2, ei).sum().backward()
+
+    base.eval(); chunked.eval()
+    with torch.no_grad():
+        assert torch.allclose(base(x, ei), chunked(x, ei), atol=1e-5)
+    assert torch.allclose(x1.grad, x2.grad, atol=1e-4), (
+        f"target_to_source grad diff = {(x1.grad - x2.grad).abs().max():.2e}"
+    )
+
+
+def test_sparse_tensor_input_does_not_crash_with_chunking():
+    """SparseTensor adj_t input must fall back to the standard path, not crash."""
+    SparseTensor = pytest.importorskip("torch_sparse").SparseTensor
+    x, ei = _random_graph(num_nodes=40, num_edges=120)
+    adj = SparseTensor(row=ei[0], col=ei[1], sparse_sizes=(40, 40)).t()
+
+    base = _SimpleGCN()
+    base.eval()
+    with torch.no_grad():
+        expected = base(x, adj)
+
+    chunked = gnn_remat(copy.deepcopy(base), chunk_nodes=5)  # would chunk a Tensor
+    chunked.eval()
+    with torch.no_grad():
+        actual = chunked(x, adj)                              # SparseTensor → no chunk
+    assert torch.allclose(expected, actual, atol=1e-5)

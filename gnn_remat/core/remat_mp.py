@@ -153,9 +153,13 @@ class RematMessagePassing(MessagePassing):
                 edge_index, size=size, **kwargs
             )
 
-        # SAR path: chunk by destination-node ranges
+        # SAR path: chunk by destination-node ranges.  Only for a plain
+        # edge_index Tensor — a SparseTensor adj_t falls through to the standard
+        # checkpoint (correct, just unchunked).
         chunk_nodes = getattr(self, '_chunk_nodes', None)
-        if chunk_nodes is not None and edge_index.size(1) > chunk_nodes:
+        if (chunk_nodes is not None
+                and isinstance(edge_index, torch.Tensor)
+                and edge_index.size(1) > chunk_nodes):
             return self._propagate_chunked(
                 edge_index, size=size, chunk_nodes=chunk_nodes, **kwargs
             )
@@ -255,26 +259,29 @@ class RematMessagePassing(MessagePassing):
 
     @staticmethod
     def _localize_node_kwargs(kwargs: dict, dst_start: int, dst_end: int,
-                              num_src: int, num_dst: int) -> dict:
+                              i_row: int) -> dict:
         """
-        Slice the destination side of the `x` node-feature kwarg to the window
-        so the chunk's scatter output is [chunk_len, F].
+        Slice the central (aggregated) side of the `x` node-feature kwarg to the
+        window so the chunk's scatter output is [chunk_len, F].
 
-        Source features stay full (messages gather by global source index);
-        only the destination features are sliced:
-          * x Tensor  → (x_full_src, x[dst_start:dst_end])
-          * x (xs, xd) → (xs, xd[dst_start:dst_end])
+        PyG maps x[0]↔edge_index row 0 and x[1]↔row 1 regardless of flow, so the
+        element to slice is the central row i_row (1 for source_to_target, 0 for
+        target_to_source).  The message-source side stays full (gathered by
+        global index):
+          * x Tensor  → x split into (full, full) with x[i_row] = x[window]
+          * x (a, b)  → element i_row sliced, the other kept full
         """
         out = dict(kwargs)
         x = out.get("x", None)
         if isinstance(x, torch.Tensor):
-            # Single tensor ⇒ homogeneous graph ⇒ src and dst share features.
-            out["x"] = (x, x[dst_start:dst_end])
+            pair = [x, x]                      # homogeneous: src and dst share x
+            pair[i_row] = x[dst_start:dst_end]
+            out["x"] = (pair[0], pair[1])
         elif isinstance(x, (tuple, list)) and len(x) == 2:
-            x_src, x_dst = x[0], x[1]
-            if isinstance(x_dst, torch.Tensor):
-                x_dst = x_dst[dst_start:dst_end]
-            out["x"] = (x_src, x_dst)
+            pair = [x[0], x[1]]
+            if isinstance(pair[i_row], torch.Tensor):
+                pair[i_row] = pair[i_row][dst_start:dst_end]
+            out["x"] = (pair[0], pair[1])
         return out
 
     # ── SAR-inspired chunked propagation ──────────────────────────────────────
@@ -309,21 +316,32 @@ class RematMessagePassing(MessagePassing):
           scatter output: O(chunk_len  × F)   — no full [num_dst, F] buffer
           node features : O(num_src × F_in)    — shared source input, not duplicated
         """
-        # Resolve graph dimensions
+        # Aggregation ("central", _i) edge_index row depends on message flow:
+        #   source_to_target → row 1 is the destination; target_to_source → row 0.
+        i_row = 1 if getattr(self, "flow", "source_to_target") == "source_to_target" else 0
+        j_row = 1 - i_row
+
+        # Resolve graph dimensions (num_dst = aggregated side, num_src = message side)
         num_dst = (
-            int(size[1]) if size is not None and size[1] is not None
-            else int(edge_index[1].max()) + 1
+            int(size[i_row]) if size is not None and size[i_row] is not None
+            else int(edge_index[i_row].max()) + 1
         )
         num_src = (
-            int(size[0]) if size is not None and size[0] is not None
-            else int(edge_index[0].max()) + 1
+            int(size[j_row]) if size is not None and size[j_row] is not None
+            else int(edge_index[j_row].max()) + 1
         )
         num_edges_total = edge_index.size(1)
 
+        def _size(n_i: int) -> tuple:
+            """Build the (row0, row1) size tuple with the central dim = n_i."""
+            s = [0, 0]
+            s[i_row], s[j_row] = n_i, num_src
+            return (s[0], s[1])
+
         # ── (1) sort edges by destination once; windows become contiguous ──────
-        perm       = torch.argsort(edge_index[1])
+        perm       = torch.argsort(edge_index[i_row])
         sorted_ei  = edge_index[:, perm]
-        sorted_dst = sorted_ei[1]
+        sorted_dst = sorted_ei[i_row]
         perm_kwargs = self._permute_edge_kwargs(kwargs, perm, num_edges_total)
 
         # Edge boundaries for every window, computed in one searchsorted + sync.
@@ -335,7 +353,11 @@ class RematMessagePassing(MessagePassing):
         ).tolist()
 
         # ── (2) decide path once ───────────────────────────────────────────────
-        local = self._can_local_remap(kwargs, num_src, num_dst, num_edges_total)
+        # ponytail: local remap only for source_to_target. PyG's x-tuple vs flow
+        # indexing makes the dst-feature slice fiddly for target_to_source; the
+        # full-size fallback is correct there (keeps the O(num_dst*F) term).
+        local = (i_row == 1
+                 and self._can_local_remap(kwargs, num_src, num_dst, num_edges_total))
 
         pieces: list[tuple[int, Optional[torch.Tensor]]] = []
         out_dtype = out_device = out_tail = None
@@ -355,16 +377,16 @@ class RematMessagePassing(MessagePassing):
             )
 
             if local:
-                # Shift dst indices into [0, chunk_len) and slice dst features.
-                chunk_ei = torch.stack(
-                    [chunk_ei[0], chunk_ei[1] - dst_start], dim=0
-                )
+                # Shift central indices into [0, chunk_len) and slice dst features.
+                rows = [chunk_ei[0], chunk_ei[1]]
+                rows[i_row] = rows[i_row] - dst_start
+                chunk_ei = torch.stack(rows, dim=0)
                 chunk_kwargs = self._localize_node_kwargs(
-                    chunk_kwargs, dst_start, dst_end, num_src, num_dst
+                    chunk_kwargs, dst_start, dst_end, i_row
                 )
-                run_size = (num_src, chunk_len)
+                run_size = _size(chunk_len)
             else:
-                run_size = (num_src, num_dst)
+                run_size = _size(num_dst)
 
             flat_chunk, spec_chunk = _flatten_kwargs(chunk_kwargs)
             any_float_grad = any(

@@ -113,7 +113,7 @@ gnn_remat/
 │   ├── models.py     ← GCN, GraphSAGE, GAT, GraphTransformer reference models.
 │   └── runner.py     ← CLI: --model gat --nodes 5000 --all --chunk-nodes auto
 │
-├── tests/            ← 82 tests across 6 files
+├── tests/            ← 88 tests across 7 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py           ← Full feature tour of all four DSL styles
@@ -205,6 +205,29 @@ Chunking is gated to training mode and to layers with more edges than
 `chunk_nodes`, so inference and small graphs pay nothing. It benefits attention
 layers (GAT, Transformer) most; for GCN/SAGE the saving is smaller and may be
 outweighed by per-chunk overhead at small scale.
+
+## Adaptability
+
+**Applicability condition.** GNN-Remat applies to any layer expressible as
+`aggregate_dst(⊕) ∘ message(φ over per-edge tensors)` where `⊕` is
+destination-decomposable (each node's result is a reduction over its own
+incoming edges: sum/mean/max/attention-softmax). Standard propagate-checkpoint
+needs only this; chunked propagation additionally needs an `edge_index` Tensor.
+
+**Capability matrix.**
+
+| Architecture | Standard remat (`aggr`/`module`) | Chunked: local remap | Chunked: fallback |
+|---|---|---|---|
+| GCN, GraphSAGE, GAT (x-based, `source_to_target`) | ✓ | ✓ (no `O(num_dst·F)` floor) | — |
+| TransformerConv / per-dst-kwarg convs | ✓ | — | ✓ (correct; keeps `num_dst·F`) |
+| `flow="target_to_source"` convs | ✓ | — | ✓ |
+| `SparseTensor` / `adj_t` input | ✓ | — | chunking auto-skipped |
+| Bipartite (`num_src ≠ num_dst`), x-tuple | ✓ | ✓ | — |
+| Heterogeneous (`HeteroConv`) | ✓ per inner conv | not addressed | not addressed |
+
+"Local remap" is the memory-optimal chunk path (output `[chunk_len, F]`);
+"fallback" is the correct full-size scatter (output `[num_dst, F]`, then sliced).
+Both are exact — same gradients as the baseline.
 
 ## How to use
 
@@ -422,7 +445,7 @@ model = remat.checkpoint.apply(my_model, rules=[
 python run_tests.py
 ```
 
-Runs all 82 tests.
+Runs all 88 tests.
 
 ## Benchmarks
 
@@ -454,7 +477,7 @@ gnn_remat/
 │   ├── profiler.py    # measures peak GPU memory + throughput
 │   ├── models.py      # GCN, GraphSAGE, GAT, GraphTransformer reference models
 │   └── runner.py      # CLI entry point (--chunk-nodes N|auto)
-├── tests/             # 82 tests across 6 files
+├── tests/             # 88 tests across 7 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py            # full feature tour of all four DSL styles
@@ -486,21 +509,22 @@ Items known to be missing or worth improving, roughly in priority order.
   under-counted concat attention by ~`heads×`.
 - **Zero-overhead inference** — `propagate()` checks `self.training` before any
   kwarg flattening, so eval truly pays nothing.
+- **`flow="target_to_source"`** — chunking now uses the flow-correct central row
+  for windowing (full-size fallback path); verified vs baseline (`test_chunked.py`).
+- **`SparseTensor` / `adj_t` input** — chunking auto-skips for non-Tensor
+  `edge_index` and falls back to the standard checkpoint (no crash).
+- **Explicit plan** — `gnn_remat(..., return_plan=True)` / `plan_of(model)` emit a
+  printable `CheckpointPlan` (per-layer checkpoint?, granularity, chunk_nodes).
 
 **Correctness gaps**
 
-- **Bipartite graph test** — `propagate()` accepts `x=(x_src, x_dst)` tuple inputs
-  for bipartite graphs.  The chunk path handles the tuple case but no test
-  exercises a true bipartite (num_src ≠ num_dst) graph end-to-end.
+- **Bipartite graph test** — the chunk path handles the `x=(x_src, x_dst)` tuple
+  case but no test exercises a true bipartite (num_src ≠ num_dst) graph end-to-end.
 
 - **Chunked propagation under attention dropout** — chunked correctness tests use
   `eval()` / dropout-free convs.  In `train()` each chunk is a separate checkpoint
   with its own RNG, so a chunked run will not reproduce a non-chunked run's dropout
   mask. The contract (bitwise-equal only in eval) should be pinned by a test.
-
-- **`flow="target_to_source"`** — `_propagate_chunked` hard-codes destinations as
-  `edge_index[1]`. Layers built with `flow="target_to_source"` would chunk the wrong
-  row and silently compute incomplete neighbourhoods. Needs handling or an assert.
 
 **Missing features**
 
