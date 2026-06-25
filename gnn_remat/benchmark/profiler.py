@@ -140,6 +140,7 @@ def profile(
     warmup: int = 1,
     criterion: Optional[Callable] = None,
     device: Optional[torch.device] = None,
+    amp: bool = False,
 ) -> ProfileResult:
     """
     Run *num_epochs* of forward + backward and record peak memory and time.
@@ -180,8 +181,12 @@ def profile(
  
         def _step():
             optimizer.zero_grad()
-            out = model_dev(x_dev, ei_dev)
-            loss = out.sum() if criterion is None else criterion(out)
+            # bf16 autocast: forward+loss only. bf16 has fp32 range so no
+            # GradScaler is needed; stacks with remat/chunking.
+            with torch.autocast(device_type=device.type,
+                                dtype=torch.bfloat16, enabled=amp):
+                out = model_dev(x_dev, ei_dev)
+                loss = out.sum() if criterion is None else criterion(out)
             loss.backward()
             optimizer.step()
  
@@ -255,6 +260,7 @@ def compare(
     num_epochs: int = 5,
     device: Optional[torch.device] = None,
     chunk_nodes: Optional[int] = None,
+    amp: bool = False,
 ) -> CompareResult:
     """
     Profile *model* under three (or four) conditions and return a CompareResult.
@@ -293,6 +299,7 @@ def compare(
         label="Baseline (PyG)",
         num_epochs=num_epochs,
         device=device,
+        amp=amp,
     )
     del base_model
     _between_conditions()
@@ -322,6 +329,7 @@ def compare(
         label="Module checkpoint",
         num_epochs=num_epochs,
         device=device,
+        amp=amp,
     )
     del module_model
     _between_conditions()
@@ -333,6 +341,7 @@ def compare(
         label="GNN-Remat",
         num_epochs=num_epochs,
         device=device,
+        amp=amp,
     )
     del remat_model
     _between_conditions()

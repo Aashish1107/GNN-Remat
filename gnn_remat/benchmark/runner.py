@@ -37,6 +37,38 @@ _SCALE_NODES = [5_000, 10_000, 25_000, 50_000, 100_000]
 _ALL_MODELS  = ["gcn", "graphsage", "gat", "transformer"]
 
 
+def _load_dataset(name: str):
+    """
+    Load a real graph for benchmarking: ogbn-* (OGB) or a torch_geometric
+    dataset (reddit, flickr).  Returns (x, edge_index, in_channels, num_classes)
+    on CPU; the profiler moves them to the device.
+    """
+    name_l = name.lower()
+    orig_load = torch.load                      # OGB needs weights_only=False
+    def _patched(f, *a, **k):
+        k.setdefault("weights_only", False)
+        return orig_load(f, *a, **k)
+    torch.load = _patched
+    try:
+        if name_l.startswith("ogbn-"):
+            from ogb.nodeproppred import PygNodePropPredDataset
+            ds = PygNodePropPredDataset(name=name_l)
+            data = ds[0]
+            return data.x, data.edge_index, data.x.size(1), ds.num_classes
+        import torch_geometric.datasets as D
+        cls = {"reddit": "Reddit", "flickr": "Flickr"}.get(name_l)
+        if cls is None:
+            raise ValueError(
+                f"Unknown --dataset {name!r}. Use ogbn-* (e.g. ogbn-arxiv, "
+                f"ogbn-products), reddit, or flickr."
+            )
+        ds = getattr(D, cls)(root=f"data/{cls}")
+        data = ds[0]
+        return data.x, data.edge_index, data.x.size(1), ds.num_classes
+    finally:
+        torch.load = orig_load
+
+
 def _make_graph(num_nodes: int, avg_degree: int, num_features: int, device):
     """Synthesise a random Erdos-Renyi graph for benchmarking."""
     x        = torch.randn(num_nodes, num_features, device=device)
@@ -118,29 +150,39 @@ def _is_cuda_context_error(exc: BaseException) -> bool:
 # ── Single run ────────────────────────────────────────────────────────────────
 
 def run_one(model_name: str, args, device):
+    x = edge_index = None
+    if args.dataset:                       # real graph overrides synthetic dims
+        x, edge_index, args.features, args.classes = _load_dataset(args.dataset)
+        args.nodes = x.size(0)
+
     chunk_nodes = _resolve_chunk_nodes(args, args.nodes)
 
     print(f"\n{'='*64}")
-    print(f"  Model: {model_name.upper()}  |  nodes={args.nodes:,}  "
+    src = f"dataset={args.dataset}" if args.dataset else "synthetic"
+    print(f"  Model: {model_name.upper()}  |  {src}  nodes={args.nodes:,}  "
           f"features={args.features}  layers={args.layers}")
     if chunk_nodes is not None:
         print(f"  Chunked propagation: chunk_nodes={chunk_nodes:,}")
+    if args.amp:
+        print(f"  AMP: bf16 autocast")
     print(f"{'='*64}")
 
     model = build(model_name, **_build_kwargs(model_name, args))
-    graph_device = torch.device("cpu")  # always build graph on CPU; profiler moves it
-    try:
-        x, edge_index = _make_graph(args.nodes, args.degree, args.features, graph_device)
-    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-        if "out of memory" not in str(e).lower() and not isinstance(
-            e, getattr(torch.cuda, "OutOfMemoryError", ())
-        ):
-            raise
-        print(f"  [skip] could not allocate graph tensors: {e}")
-        return None
+    if x is None:
+        graph_device = torch.device("cpu")  # build on CPU; profiler moves it
+        try:
+            x, edge_index = _make_graph(args.nodes, args.degree, args.features,
+                                        graph_device)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" not in str(e).lower() and not isinstance(
+                e, getattr(torch.cuda, "OutOfMemoryError", ())
+            ):
+                raise
+            print(f"  [skip] could not allocate graph tensors: {e}")
+            return None
 
     result = compare(model, x, edge_index, num_epochs=args.epochs,
-                     device=device, chunk_nodes=chunk_nodes)
+                     device=device, chunk_nodes=chunk_nodes, amp=args.amp)
     print(result.summary())
     return result
 
@@ -187,7 +229,7 @@ def run_scale_sweep(model_name: str, args, device):
 
         try:
             result = compare(model, x, ei, num_epochs=args.epochs,
-                             device=device, chunk_nodes=chunk_nodes)
+                             device=device, chunk_nodes=chunk_nodes, amp=args.amp)
         except Exception as exc:
             del model, x, ei
             if _is_cuda_context_error(exc):
@@ -284,7 +326,7 @@ def find_oom_limit(model_name: str, args, device):
 
         try:
             result = compare(model, x, ei, num_epochs=2, device=device,
-                             chunk_nodes=chunk_nodes)
+                             chunk_nodes=chunk_nodes, amp=args.amp)
         except Exception as exc:
             del model, x, ei
             if _is_cuda_context_error(exc):
@@ -373,6 +415,11 @@ def main(argv=None):
                         help="Enable SAR-inspired chunked propagation. Pass an integer "
                              "(e.g. 5000) or 'auto' to compute from GPU memory. "
                              "Adds a 4th benchmark condition 'GNN-Remat+Chunk'.")
+    parser.add_argument("--amp", action="store_true",
+                        help="bf16 autocast for every condition (stacks with remat/chunk).")
+    parser.add_argument("--dataset", default=None, metavar="NAME",
+                        help="Real graph instead of synthetic: ogbn-arxiv, "
+                             "ogbn-products, reddit, flickr (single run; ignores --scale).")
     args = parser.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -383,13 +430,13 @@ def main(argv=None):
     overview: list[tuple[str, str]] = []
     for name in models_to_run:
         try:
-            if args.scale:
+            if args.scale and not args.dataset:
                 run_scale_sweep(name, args, device)
                 overview.append((name, "scale sweep done"))
-            elif args.find_limit:
+            elif args.find_limit and not args.dataset:
                 find_oom_limit(name, args, device)
                 overview.append((name, "limit search done"))
-            else:
+            else:  # single run (always for --dataset, which is one fixed graph)
                 result = run_one(name, args, device)
                 if result is None:
                     overview.append((name, "skipped (graph alloc failed)"))

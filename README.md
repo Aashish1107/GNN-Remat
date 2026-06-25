@@ -113,7 +113,7 @@ gnn_remat/
 │   ├── models.py     ← GCN, GraphSAGE, GAT, GraphTransformer reference models.
 │   └── runner.py     ← CLI: --model gat --nodes 5000 --all --chunk-nodes auto
 │
-├── tests/            ← 88 tests across 7 files
+├── tests/            ← 89 tests across 8 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py           ← Full feature tour of all four DSL styles
@@ -445,7 +445,7 @@ model = remat.checkpoint.apply(my_model, rules=[
 python run_tests.py
 ```
 
-Runs all 88 tests.
+Runs all 89 tests.
 
 ## Benchmarks
 
@@ -460,6 +460,12 @@ python -m gnn_remat.benchmark.runner --model gat --scale --chunk-nodes auto
 
 # Find the graph size where the baseline OOMs but GNN-Remat still fits (CUDA):
 python -m gnn_remat.benchmark.runner --model gat --find-limit --chunk-nodes auto
+
+# Real datasets (single run): ogbn-arxiv, ogbn-products, reddit, flickr
+python -m gnn_remat.benchmark.runner --model gat --dataset ogbn-products --chunk-nodes auto
+
+# bf16 autocast (stacks with remat/chunk) — applies to every condition
+python -m gnn_remat.benchmark.runner --model gat --nodes 50000 --chunk-nodes auto --amp
 ```
 
 ## Project layout
@@ -477,7 +483,7 @@ gnn_remat/
 │   ├── profiler.py    # measures peak GPU memory + throughput
 │   ├── models.py      # GCN, GraphSAGE, GAT, GraphTransformer reference models
 │   └── runner.py      # CLI entry point (--chunk-nodes N|auto)
-├── tests/             # 88 tests across 7 files
+├── tests/             # 89 tests across 8 files
 ├── examples/
 │   └── train_ogbn_arxiv.py
 ├── demo.py            # full feature tour of all four DSL styles
