@@ -73,7 +73,7 @@ memory bottleneck.
 │            saves only: x_proj [N, out]  ← node-level, small        │
 │  backward: re-runs message + aggregate only (no linear recompute)   │
 │  result:   frees large per-edge tensors, keeps cheap node tensors   │
-│            lower memory than module checkpoint, faster too          │
+│            faster than module ckpt; chunk = the memory win          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -118,7 +118,7 @@ gnn_remat/
 │   └── train_ogbn_arxiv.py
 ├── demo.py           ← Full feature tour of all four DSL styles
 └── __init__.py       ← Public API: gnn_remat(), detect(), remove_remat(),
-                         auto_chunk_size()
+                         auto_chunk_size(), plan_of()
 ```
 
 ---
@@ -134,7 +134,8 @@ GATConv's `lin_src` / `lin_dst`) stay in the autograd graph and are never recomp
 ```
 Baseline PyG           →  stores all activations          →  high memory, fast
 torch.utils.checkpoint →  recomputes full layers           →  low memory, slow
-GNN-Remat              →  recomputes propagate() only      →  lower memory, faster
+GNN-Remat              →  recomputes propagate() only       →  faster than module ckpt
+GNN-Remat + chunk      →  windows edges by destination      →  largest memory cut
 ```
 
 ### Benchmark (25 K nodes, 250 K edges, hidden=256, heads=4, 3 layers)
@@ -279,6 +280,18 @@ for info in detect(model):
 # conv1  GATConv
 # conv2  GATConv
 # conv3  GATConv
+```
+
+**Inspect the checkpointing plan** (per-layer decision — what actually got wrapped):
+
+```python
+from gnn_remat import gnn_remat, plan_of
+
+model, plan = gnn_remat(model, chunk_nodes=5000, return_plan=True)
+print(plan)                 # or plan_of(model) on any wrapped model
+# layer   type     ckpt  gran  chunk  reason
+# conv1   GATConv  yes   aggr  5000   propagate checkpoint
+# ...
 ```
 
 **Strip wrappers** (for saving checkpoints or switching to inference-only mode):
@@ -433,9 +446,13 @@ model = remat.checkpoint.apply(my_model, rules=[
 |---|---|---|
 | What is checkpointed | `propagate()` only | entire layer forward |
 | What is recomputed | message() + scatter | linear projections + attention + scatter |
-| Memory savings (GAT) | ~17% | ~20% |
+| Memory savings (GAT, 25 K) | ~18% | ~20% |
 | Throughput overhead | lower | higher |
 | Best for | attention GNNs (GAT, Transformer) | any model, maximum savings |
+
+For a much larger cut, add `chunk_nodes=` on top of `aggr` (37–73 % measured;
+see the benchmark table above) — that, not the granularity choice, is where the
+big memory reduction comes from.
 
 ### When does remat help?
 
@@ -530,6 +547,9 @@ Items known to be missing or worth improving, roughly in priority order.
   `edge_index` and falls back to the standard checkpoint (no crash).
 - **Explicit plan** — `gnn_remat(..., return_plan=True)` / `plan_of(model)` emit a
   printable `CheckpointPlan` (per-layer checkpoint?, granularity, chunk_nodes).
+- **AMP benchmarking** — `--amp` (bf16 autocast) in profiler/runner stacks with
+  remat/chunk; smoke-tested (`test_profiler.py`). remat also runs under a
+  user-supplied `torch.autocast` context.
 
 **Correctness gaps**
 
@@ -542,10 +562,6 @@ Items known to be missing or worth improving, roughly in priority order.
   mask. The contract (bitwise-equal only in eval) should be pinned by a test.
 
 **Missing features**
-
-- **Mixed precision (AMP / bf16)** — no autocast support or test; ~2× memory on
-  every tensor and faster matmuls, stacking with remat/chunking. Biggest absolute
-  lever still on the table.
 
 - **Memory budget API** — `gnn_remat(model, memory_budget_mb=6000)` would select
   layers greedily until the budget is met.  Currently users must reason about
@@ -571,10 +587,9 @@ Items known to be missing or worth improving, roughly in priority order.
   `torch.compile(fullgraph=True)`.  Needs a test or a documented limitation with a
   workaround (`fullgraph=False`).
 
-- **AMP (mixed-precision) verification** — `torch.cuda.amp.autocast()` combined with
-  `use_reentrant=False` checkpointing is generally safe in PyTorch ≥ 2.0, but the
-  interaction with GAT's softmax (which may cast to float32 internally) has not been
-  tested here.
+- **AMP numerical parity** — the `--amp` (bf16) path runs remat/chunk + GATConv
+  end-to-end without error, but exact numerical parity of GAT's softmax under bf16
+  autocast + `use_reentrant=False` checkpointing is not pinned by a test.
 
 - **Gradient accumulation** — multiple forward passes before a single backward
   (common in large-batch training) has not been tested with the propagate-level
