@@ -24,6 +24,7 @@ Usage
 from __future__ import annotations
 
 import gc
+import sys
 import argparse
 import traceback
 
@@ -380,6 +381,12 @@ def find_oom_limit(model_name: str, args, device):
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main(argv=None):
+    # Box-drawing chars in the tables crash the Windows cp1252 console; force UTF-8.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(
         description="GNN-Remat benchmark runner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
